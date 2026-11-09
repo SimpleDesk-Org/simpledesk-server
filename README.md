@@ -1,3 +1,21 @@
+# SimpleDesk Server
+
+SimpleDesk ist ein Fork des kostenlosen RustDesk-Servers ([rustdesk/rustdesk-server](https://github.com/rustdesk/rustdesk-server)) unter derselben Lizenz (AGPL-3.0). Ziel: Alles läuft über Port 443, auch wenn eine Firewall nur Webseiten durchlässt.
+
+## Änderungen gegenüber dem RustDesk-Server
+
+- Geräte können sich auch über TCP und WebSocket anmelden, nicht nur über UDP. Die Verbindung bleibt offen, der Server schickt alle 20 Sekunden ein Lebenszeichen, und Anfragen anderer Geräte kommen über diese Verbindung.
+- Neuer Schalter `WS_ONLY=Y` für hbbs und hbbr: Nur die WebSocket-Ports (21118 und 21119) lauschen auf der Bind-Adresse, alle anderen Ports nur auf 127.0.0.1. Verbindungen laufen dann immer über das Relay.
+
+## Betrieb nur über Port 443
+
+1. hbbs und hbbr mit `WS_ONLY=Y` starten.
+2. Einen Reverse Proxy mit HTTPS davorsetzen: `/ws/id` an Port 21118, `/ws/relay` an Port 21119. Der Proxy muss `X-Real-IP` setzen.
+3. Die Ports 21118 und 21119 dürfen nur für den Proxy erreichbar sein, nicht aus dem Internet. Der Server übernimmt die IP aus `X-Real-IP` ungeprüft.
+4. In jedem RustDesk-Client `allow-websocket` auf `Y` setzen und als API-Server `https://<deine Domain>` eintragen.
+
+---
+
 # RustDesk Server Program
 
 [![build](https://github.com/rustdesk/rustdesk-server/actions/workflows/build.yaml/badge.svg)](https://github.com/rustdesk/rustdesk-server/actions/workflows/build.yaml)
