@@ -716,6 +716,17 @@ impl RendezvousServer {
         conn: &mut TcpConn,
     ) -> bool {
         let addr = try_into_v4(addr);
+        if !rk.old_id.is_empty() {
+            // SimpleDesk: the device asks for a new ID (rustdesk --set-id).
+            let res = self.change_id_result(&rk, addr).await;
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_register_pk_response(RegisterPkResponse {
+                result: res.into(),
+                ..Default::default()
+            });
+            Self::send_to_sink(sink, msg_out).await;
+            return false;
+        }
         let id = rk.id.clone();
         let Some(res) = self.register_pk_result(rk, addr).await else {
             return false;
@@ -740,6 +751,46 @@ impl RendezvousServer {
         });
         Self::send_to_sink(sink, msg_out).await;
         true
+    }
+
+    /// SimpleDesk: checks and applies an ID change. The client sends old_id, the new id
+    /// and its uuid; only the device that owns old_id may rename it.
+    async fn change_id_result(
+        &mut self,
+        rk: &RegisterPk,
+        addr: SocketAddr,
+    ) -> register_pk_response::Result {
+        use register_pk_response::Result::{ID_EXISTS, INVALID_ID_FORMAT, OK};
+        if rk.uuid.is_empty() || !hbb_common::is_valid_custom_id(&rk.id) {
+            return INVALID_ID_FORMAT;
+        }
+        if !self.check_ip_blocker(&addr.ip().to_string(), &rk.id).await {
+            return TOO_FREQUENT;
+        }
+        if rk.id == rk.old_id {
+            return OK;
+        }
+        if let Some(peer) = self.pm.get(&rk.id).await {
+            let uuid = peer.read().await.uuid.clone();
+            if !uuid.is_empty() {
+                // Already this device's ID, or taken by another device.
+                return if uuid == rk.uuid { OK } else { ID_EXISTS };
+            }
+        }
+        let Some(peer) = self.pm.get(&rk.old_id).await else {
+            // The old ID is unknown here, so there is nothing to rename.
+            return OK;
+        };
+        let old_uuid = peer.read().await.uuid.clone();
+        if old_uuid.is_empty() {
+            // Never registered with a key, so there is nothing to rename either.
+            return OK;
+        }
+        if old_uuid != rk.uuid {
+            log::warn!("Change id of {} refused: uuid mismatch", rk.old_id);
+            return UUID_MISMATCH;
+        }
+        self.pm.change_id(peer, &rk.old_id, &rk.id).await
     }
 
     /// SimpleDesk: sends a message to a device registered over TCP/WebSocket.
@@ -1781,11 +1832,35 @@ mod tests {
     }
 
     fn register_pk_msg(id: &str) -> Bytes {
+        register_pk_msg_for(id, b"simpledesk-test-uuid")
+    }
+
+    fn register_pk_msg_for(id: &str, uuid: &'static [u8]) -> Bytes {
         let mut msg = RendezvousMessage::new();
         msg.set_register_pk(RegisterPk {
             id: id.to_owned(),
-            uuid: Bytes::from_static(b"simpledesk-test-uuid"),
+            uuid: Bytes::from_static(uuid),
             pk: Bytes::from(vec![7u8; 32]),
+            ..Default::default()
+        });
+        Bytes::from(msg.write_to_bytes().unwrap())
+    }
+
+    /// Sends one message on a new TCP connection and returns the RegisterPk result.
+    async fn register_result(rs: &RendezvousServer, bytes: Bytes) -> register_pk_response::Result {
+        let stream = TcpStream::connect(serve_one(rs, false).await).await.unwrap();
+        let mut device = Framed::new(stream, BytesCodec::new());
+        device.send(bytes).await.unwrap();
+        let msg = next_tcp_msg(&mut device).await;
+        msg.register_pk_response().result.enum_value().unwrap()
+    }
+
+    fn change_id_msg(old_id: &str, id: &str, uuid: &'static [u8]) -> Bytes {
+        let mut msg = RendezvousMessage::new();
+        msg.set_register_pk(RegisterPk {
+            old_id: old_id.to_owned(),
+            id: id.to_owned(),
+            uuid: Bytes::from_static(uuid),
             ..Default::default()
         });
         Bytes::from(msg.write_to_bytes().unwrap())
@@ -1908,6 +1983,44 @@ mod tests {
         let next = timeout(5_000, device.next()).await.unwrap();
         assert!(!matches!(next, Some(Ok(_))), "connection stayed open: {next:?}");
         assert!(!rs.send_to_tcp_peer(&punch_hole_msg(), device_addr).await);
+    }
+
+    #[hbb_common::tokio::test]
+    async fn device_changes_its_id() {
+        use register_pk_response::Result::{ID_EXISTS, INVALID_ID_FORMAT, OK};
+        let dir = tempfile::tempdir().unwrap();
+        let rs = test_server(&dir).await;
+        let me: &'static [u8] = b"uuid-of-this-device";
+        let other: &'static [u8] = b"uuid-of-other-device";
+        assert_eq!(register_result(&rs, register_pk_msg_for("Felix-Old-PC", me)).await, OK);
+        assert_eq!(register_result(&rs, register_pk_msg_for("Someone-Else", other)).await, OK);
+
+        // Rename: the old ID is gone, the new one points to the same device.
+        assert_eq!(
+            register_result(&rs, change_id_msg("Felix-Old-PC", "Felix-Work-PC", me)).await,
+            OK
+        );
+        assert!(rs.pm.get_in_memory("Felix-Old-PC").await.is_none());
+        assert!(rs.pm.db.get_peer("Felix-Old-PC").await.unwrap().is_none());
+        let renamed = rs.pm.db.get_peer("Felix-Work-PC").await.unwrap().unwrap();
+        assert_eq!(renamed.uuid, me.to_vec());
+
+        // Taken by another device, wrong format, or not this device's ID.
+        assert_eq!(
+            register_result(&rs, change_id_msg("Felix-Work-PC", "Someone-Else", me)).await,
+            ID_EXISTS
+        );
+        assert_eq!(
+            register_result(&rs, change_id_msg("Felix-Work-PC", "1-starts-with-digit", me)).await,
+            INVALID_ID_FORMAT
+        );
+        assert_eq!(
+            register_result(&rs, change_id_msg("Felix-Work-PC", "Stolen-Name", other)).await,
+            UUID_MISMATCH
+        );
+
+        // The device registers again under its new ID.
+        assert_eq!(register_result(&rs, register_pk_msg_for("Felix-Work-PC", me)).await, OK);
     }
 
     #[test]

@@ -135,6 +135,35 @@ impl PeerMap {
         register_pk_response::Result::OK
     }
 
+    /// SimpleDesk: renames a device in memory and in the database.
+    /// The caller has checked that the device owns old_id and that new_id is free.
+    pub(crate) async fn change_id(
+        &self,
+        peer: LockPeer,
+        old_id: &str,
+        new_id: &str,
+    ) -> register_pk_response::Result {
+        let (guid, pk, info_str) = {
+            let peer = peer.read().await;
+            (
+                peer.guid.clone(),
+                peer.pk.clone(),
+                serde_json::to_string(&peer.info).unwrap_or_default(),
+            )
+        };
+        if !guid.is_empty() {
+            if let Err(err) = self.db.update_pk(&guid, new_id, &pk, &info_str).await {
+                log::error!("db.update_pk failed while changing id: {}", err);
+                return register_pk_response::Result::SERVER_ERROR;
+            }
+        }
+        let mut map = self.map.write().await;
+        map.remove(old_id);
+        map.insert(new_id.to_owned(), peer);
+        log::info!("id changed from {} to {}", old_id, new_id);
+        register_pk_response::Result::OK
+    }
+
     #[inline]
     pub(crate) async fn get(&self, id: &str) -> Option<LockPeer> {
         let p = self.map.read().await.get(id).cloned();
