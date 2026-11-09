@@ -25,6 +25,22 @@ pub fn parse_bind_address(value: &str) -> Result<Option<IpAddr>> {
     }
 }
 
+/// SimpleDesk: with WS_ONLY=Y only the WebSocket ports listen on the bind address. All
+/// other ports listen on 127.0.0.1, so from outside everything goes through the reverse
+/// proxy in front of the WebSocket ports (port 443).
+pub fn ws_only() -> bool {
+    get_arg("WS_ONLY").to_uppercase() == "Y"
+}
+
+/// Bind address for the ports that are not WebSocket, see [`ws_only`].
+pub fn internal_bind_address(bind_addr: Option<IpAddr>, ws_only: bool) -> Option<IpAddr> {
+    if ws_only {
+        Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+    } else {
+        bind_addr
+    }
+}
+
 pub async fn listen_tcp(
     bind_addr: Option<IpAddr>,
     port: u16,

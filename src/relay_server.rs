@@ -96,13 +96,17 @@ pub async fn start_with_bind(
     log::info!("Listening on tcp :{}", port);
     let port2 = port + 2;
     log::info!("Listening on websocket :{}", port2);
+    // SimpleDesk: with WS_ONLY only the WebSocket port listens on bind_addr.
+    let ws_only = crate::common::ws_only();
+    let internal_addr = crate::common::internal_bind_address(bind_addr, ws_only);
+    log::info!("WS_ONLY={}", if ws_only { "Y" } else { "N" });
     let main_task = async move {
         loop {
             log::info!("Start");
             io_loop(
-                crate::common::listen_tcp(bind_addr, port).await?,
+                crate::common::listen_tcp(internal_addr, port).await?,
                 crate::common::listen_tcp(bind_addr, port2).await?,
-                crate::common::listen_console(bind_addr, port).await?,
+                crate::common::listen_console(internal_addr, port).await?,
                 &key,
             )
             .await;

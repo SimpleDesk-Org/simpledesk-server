@@ -7,8 +7,9 @@ use hbb_common::{
     config,
     futures::future::join_all,
     futures_util::{
+        future::ready,
         sink::SinkExt,
-        stream::{SplitSink, StreamExt},
+        stream::{SplitSink, Stream, StreamExt},
     },
     log,
     protobuf::{Message as _, MessageField},
@@ -48,6 +49,25 @@ enum Data {
 }
 
 const REG_TIMEOUT: i64 = 30_000;
+// SimpleDesk: devices may register over TCP/WebSocket. The connection stays open, the
+// server sends an empty heartbeat and the device echoes it, which keeps it online.
+const TCP_HEARTBEAT_MS: u128 = 20_000;
+// A registered connection without any message for this long is dropped.
+const TCP_PEER_IDLE_MS: u128 = 60_000;
+// Other TCP/WebSocket connections are dropped after this, as before.
+const TCP_IDLE_MS: u128 = 30_000;
+const TCP_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+// Told to the device in seconds; it reconnects after 1.5 times this without a message.
+const TCP_KEEP_ALIVE_SECS: i32 = 30;
+// Open connections of devices registered over TCP/WebSocket, by their peer address.
+type TcpPeers = Arc<Mutex<HashMap<SocketAddr, mpsc::UnboundedSender<Bytes>>>>;
+// SimpleDesk: state of one TCP/WebSocket connection.
+struct TcpConn {
+    // Messages for the device registered on this connection.
+    tx: mpsc::UnboundedSender<Bytes>,
+    // Id of the device registered on this connection, if any.
+    registered: Option<String>,
+}
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
@@ -141,6 +161,7 @@ struct Inner {
 #[derive(Clone)]
 pub struct RendezvousServer {
     tcp_punch: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
+    tcp_peers: TcpPeers,
     pm: PeerMap,
     tx: Sender,
     relay_servers: Arc<RelayServers>,
@@ -176,7 +197,11 @@ impl RendezvousServer {
         let pm = PeerMap::new().await?;
         log::info!("serial={}", serial);
         let rendezvous_servers = get_servers(&get_arg("rendezvous-servers"), "rendezvous-servers");
-        let mut socket = create_udp_listener(bind_addr, port, rmem).await?;
+        // SimpleDesk: with WS_ONLY only the WebSocket port listens on bind_addr.
+        let ws_only = ws_only();
+        let internal_addr = internal_bind_address(bind_addr, ws_only);
+        log::info!("WS_ONLY={}", if ws_only { "Y" } else { "N" });
+        let mut socket = create_udp_listener(internal_addr, port, rmem).await?;
         let (tx, mut rx) = mpsc::unbounded_channel::<Data>();
         let software_url = get_arg("software-url");
         let version = hbb_common::get_version_from_url(&software_url);
@@ -196,6 +221,7 @@ impl RendezvousServer {
         };
         let mut rs = Self {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
+            tcp_peers: Arc::new(Mutex::new(HashMap::new())),
             pm,
             tx: tx.clone(),
             relay_servers: Default::default(),
@@ -214,10 +240,10 @@ impl RendezvousServer {
         log::info!("local-ip: {:?}", rs.inner.local_ip);
         std::env::set_var("PORT_FOR_API", port.to_string());
         rs.parse_relay_servers(&get_arg("relay-servers"));
-        let mut listener = create_tcp_listener(bind_addr, port).await?;
-        let mut listener2 = create_tcp_listener(bind_addr, nat_port).await?;
+        let mut listener = create_tcp_listener(internal_addr, port).await?;
+        let mut listener2 = create_tcp_listener(internal_addr, nat_port).await?;
         let mut listener3 = create_tcp_listener(bind_addr, ws_port).await?;
-        let mut listener_console = listen_console(bind_addr, nat_port as _).await?;
+        let mut listener_console = listen_console(internal_addr, nat_port as _).await?;
         log::info!("Listening on tcp/udp {}", listener.local_addr()?);
         log::info!(
             "Listening on tcp {}, extra port for NAT test",
@@ -226,7 +252,8 @@ impl RendezvousServer {
         log::info!("Listening on websocket {}", listener3.local_addr()?);
         log::info!("MAX_MESSAGE_KB={}", *MAX_MESSAGE >> 10);
         let test_addr = get_arg("TEST_HBBS");
-        if get_arg("ALWAYS_USE_RELAY").to_uppercase() == "Y" {
+        // SimpleDesk: without the other ports every connection has to go over the relay.
+        if ws_only || get_arg("ALWAYS_USE_RELAY").to_uppercase() == "Y" {
             ALWAYS_USE_RELAY.store(true, Ordering::SeqCst);
         }
         log::info!(
@@ -276,19 +303,19 @@ impl RendezvousServer {
                 {
                     LoopFailure::UdpSocket => {
                         drop(socket);
-                        socket = create_udp_listener(bind_addr, port, rmem).await?;
+                        socket = create_udp_listener(internal_addr, port, rmem).await?;
                     }
                     LoopFailure::Listener => {
                         drop(listener);
-                        listener = create_tcp_listener(bind_addr, port).await?;
+                        listener = create_tcp_listener(internal_addr, port).await?;
                     }
                     LoopFailure::Listener2 => {
                         drop(listener2);
-                        listener2 = create_tcp_listener(bind_addr, nat_port).await?;
+                        listener2 = create_tcp_listener(internal_addr, nat_port).await?;
                     }
                     LoopFailure::ConsoleListener => {
                         drop(listener_console.take());
-                        listener_console = listen_console(bind_addr, nat_port as _).await?;
+                        listener_console = listen_console(internal_addr, nat_port as _).await?;
                     }
                     LoopFailure::Listener3 => {
                         drop(listener3);
@@ -328,7 +355,12 @@ impl RendezvousServer {
                 }
                 Some(data) = rx.recv() => {
                     match data {
-                        Data::Msg(msg, addr) => { allow_err!(socket.send(msg.as_ref(), addr).await); }
+                        Data::Msg(msg, addr) => {
+                            // SimpleDesk: a device registered over TCP/WebSocket gets it there.
+                            if !self.send_to_tcp_peer(&msg, addr).await {
+                                allow_err!(socket.send(msg.as_ref(), addr).await);
+                            }
+                        }
                         Data::RelayServers0(rs) => { self.parse_relay_servers(&rs); }
                         Data::RelayServers(rs) => { self.relay_servers = Arc::new(rs); }
                     }
@@ -429,89 +461,9 @@ impl RendezvousServer {
                     }
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
-                    if rk.uuid.is_empty() || rk.pk.is_empty() {
-                        return Ok(());
+                    if let Some(res) = self.register_pk_result(rk, addr).await {
+                        return send_rk_res(socket, addr, res).await;
                     }
-                    let id = rk.id;
-                    let ip = addr.ip().to_string();
-                    if id.len() < 6 || id.len() > MAX_PEER_ID_LEN {
-                        return send_rk_res(socket, addr, UUID_MISMATCH).await;
-                    } else if !self.check_ip_blocker(&ip, &id).await {
-                        return send_rk_res(socket, addr, TOO_FREQUENT).await;
-                    }
-                    let peer = self.pm.get_or(&id).await;
-                    let (changed, ip_changed) = {
-                        let peer = peer.read().await;
-                        if peer.uuid.is_empty() {
-                            (true, false)
-                        } else {
-                            if peer.uuid == rk.uuid {
-                                if peer.info.ip != ip && peer.pk != rk.pk {
-                                    log::warn!(
-                                        "Peer {} ip/pk mismatch: {}/{:?} vs {}/{:?}",
-                                        id,
-                                        ip,
-                                        rk.pk,
-                                        peer.info.ip,
-                                        peer.pk,
-                                    );
-                                    drop(peer);
-                                    return send_rk_res(socket, addr, UUID_MISMATCH).await;
-                                }
-                            } else {
-                                log::warn!(
-                                    "Peer {} uuid mismatch: {:?} vs {:?}",
-                                    id,
-                                    rk.uuid,
-                                    peer.uuid
-                                );
-                                drop(peer);
-                                return send_rk_res(socket, addr, UUID_MISMATCH).await;
-                            }
-                            let ip_changed = peer.info.ip != ip;
-                            (
-                                peer.uuid != rk.uuid || peer.pk != rk.pk || ip_changed,
-                                ip_changed,
-                            )
-                        }
-                    };
-                    let mut req_pk = peer.read().await.reg_pk;
-                    if req_pk.1.elapsed().as_secs() > 6 {
-                        req_pk.0 = 0;
-                    } else if req_pk.0 > 2 {
-                        return send_rk_res(socket, addr, TOO_FREQUENT).await;
-                    }
-                    req_pk.0 += 1;
-                    req_pk.1 = Instant::now();
-                    peer.write().await.reg_pk = req_pk;
-                    if ip_changed {
-                        let mut lock = IP_CHANGES.lock().await;
-                        if let Some((tm, ips)) = lock.get_mut(&id) {
-                            if tm.elapsed().as_secs() > IP_CHANGE_DUR {
-                                *tm = Instant::now();
-                                ips.clear();
-                                ips.insert(ip.clone(), 1);
-                            } else if let Some(v) = ips.get_mut(&ip) {
-                                *v += 1;
-                            } else {
-                                ips.insert(ip.clone(), 1);
-                            }
-                        } else {
-                            lock.insert(
-                                id.clone(),
-                                (Instant::now(), HashMap::from([(ip.clone(), 1)])),
-                            );
-                        }
-                    }
-                    if changed {
-                        self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
-                    }
-                    let mut msg_out = RendezvousMessage::new();
-                    msg_out.set_register_pk_response(RegisterPkResponse {
-                        result: register_pk_response::Result::OK.into(),
-                        ..Default::default()
-                    });
-                    socket.send(&msg_out, addr).await?
                 }
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                     // UDP PunchHoleRequest is intentionally unsupported.
@@ -568,7 +520,16 @@ impl RendezvousServer {
         addr: SocketAddr,
         key: &str,
         ws: bool,
+        conn: &mut TcpConn,
     ) -> bool {
+        if bytes.is_empty() {
+            // SimpleDesk: a registered device echoes the empty heartbeat.
+            if let Some(id) = conn.registered.clone() {
+                self.touch_tcp_peer(&id, try_into_v4(addr)).await;
+                return true;
+            }
+            return false;
+        }
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
@@ -648,19 +609,162 @@ impl RendezvousServer {
                     msg_out.set_test_nat_response(res);
                     Self::send_to_sink(sink, msg_out).await;
                 }
-                Some(rendezvous_message::Union::RegisterPk(_)) => {
-                    let res = register_pk_response::Result::NOT_SUPPORT;
-                    let mut msg_out = RendezvousMessage::new();
-                    msg_out.set_register_pk_response(RegisterPkResponse {
-                        result: res.into(),
-                        ..Default::default()
-                    });
-                    Self::send_to_sink(sink, msg_out).await;
+                Some(rendezvous_message::Union::RegisterPk(rk)) => {
+                    // SimpleDesk: accepted over TCP/WebSocket too, the connection stays open.
+                    return self.handle_tcp_register_pk(rk, sink, addr, conn).await;
                 }
                 _ => {}
             }
         }
         false
+    }
+
+    /// Checks a RegisterPk and stores the key of the device. Shared by UDP and
+    /// TCP/WebSocket (SimpleDesk). None means the request is ignored without an answer.
+    async fn register_pk_result(
+        &mut self,
+        rk: RegisterPk,
+        addr: SocketAddr,
+    ) -> Option<register_pk_response::Result> {
+        if rk.uuid.is_empty() || rk.pk.is_empty() {
+            return None;
+        }
+        let id = rk.id;
+        let ip = addr.ip().to_string();
+        if id.len() < 6 || id.len() > MAX_PEER_ID_LEN {
+            return Some(UUID_MISMATCH);
+        } else if !self.check_ip_blocker(&ip, &id).await {
+            return Some(TOO_FREQUENT);
+        }
+        let peer = self.pm.get_or(&id).await;
+        let (changed, ip_changed) = {
+            let peer = peer.read().await;
+            if peer.uuid.is_empty() {
+                (true, false)
+            } else {
+                if peer.uuid == rk.uuid {
+                    if peer.info.ip != ip && peer.pk != rk.pk {
+                        log::warn!(
+                            "Peer {} ip/pk mismatch: {}/{:?} vs {}/{:?}",
+                            id,
+                            ip,
+                            rk.pk,
+                            peer.info.ip,
+                            peer.pk,
+                        );
+                        drop(peer);
+                        return Some(UUID_MISMATCH);
+                    }
+                } else {
+                    log::warn!(
+                        "Peer {} uuid mismatch: {:?} vs {:?}",
+                        id,
+                        rk.uuid,
+                        peer.uuid
+                    );
+                    drop(peer);
+                    return Some(UUID_MISMATCH);
+                }
+                let ip_changed = peer.info.ip != ip;
+                (
+                    peer.uuid != rk.uuid || peer.pk != rk.pk || ip_changed,
+                    ip_changed,
+                )
+            }
+        };
+        let mut req_pk = peer.read().await.reg_pk;
+        if req_pk.1.elapsed().as_secs() > 6 {
+            req_pk.0 = 0;
+        } else if req_pk.0 > 2 {
+            return Some(TOO_FREQUENT);
+        }
+        req_pk.0 += 1;
+        req_pk.1 = Instant::now();
+        peer.write().await.reg_pk = req_pk;
+        if ip_changed {
+            let mut lock = IP_CHANGES.lock().await;
+            if let Some((tm, ips)) = lock.get_mut(&id) {
+                if tm.elapsed().as_secs() > IP_CHANGE_DUR {
+                    *tm = Instant::now();
+                    ips.clear();
+                    ips.insert(ip.clone(), 1);
+                } else if let Some(v) = ips.get_mut(&ip) {
+                    *v += 1;
+                } else {
+                    ips.insert(ip.clone(), 1);
+                }
+            } else {
+                lock.insert(
+                    id.clone(),
+                    (Instant::now(), HashMap::from([(ip.clone(), 1)])),
+                );
+            }
+        }
+        if changed {
+            self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
+        }
+        Some(register_pk_response::Result::OK)
+    }
+
+    /// SimpleDesk: a device registers over TCP/WebSocket. On success the connection is
+    /// remembered, so messages for the device are sent over it instead of UDP.
+    async fn handle_tcp_register_pk(
+        &mut self,
+        rk: RegisterPk,
+        sink: &mut Option<Sink>,
+        addr: SocketAddr,
+        conn: &mut TcpConn,
+    ) -> bool {
+        let addr = try_into_v4(addr);
+        let id = rk.id.clone();
+        let Some(res) = self.register_pk_result(rk, addr).await else {
+            return false;
+        };
+        let ok = res == register_pk_response::Result::OK;
+        if ok {
+            if let Some(peer) = self.pm.get_in_memory(&id).await {
+                let mut peer = peer.write().await;
+                peer.socket_addr = addr;
+                peer.last_reg_time = Instant::now();
+            }
+            if let Some(old) = conn.registered.replace(id) {
+                log::info!("Connection {} registered again, was {}", addr, old);
+            }
+            self.tcp_peers.lock().await.insert(addr, conn.tx.clone());
+        }
+        let mut msg_out = RendezvousMessage::new();
+        msg_out.set_register_pk_response(RegisterPkResponse {
+            result: res.into(),
+            keep_alive: if ok { TCP_KEEP_ALIVE_SECS } else { 0 },
+            ..Default::default()
+        });
+        Self::send_to_sink(sink, msg_out).await;
+        true
+    }
+
+    /// SimpleDesk: sends a message to a device registered over TCP/WebSocket.
+    /// Returns false if no such device has this address, then UDP is used as before.
+    async fn send_to_tcp_peer(&self, msg: &RendezvousMessage, addr: SocketAddr) -> bool {
+        let Some(tx) = self.tcp_peers.lock().await.get(&addr).cloned() else {
+            return false;
+        };
+        match msg.write_to_bytes() {
+            Ok(bytes) => {
+                tx.send(Bytes::from(bytes)).ok();
+            }
+            Err(err) => log::error!("write_to_bytes failed: {}", err),
+        }
+        true
+    }
+
+    /// SimpleDesk: the device echoed the heartbeat, so it is still online.
+    async fn touch_tcp_peer(&self, id: &str, addr: SocketAddr) {
+        if let Some(peer) = self.pm.get_in_memory(id).await {
+            let mut peer = peer.write().await;
+            if peer.socket_addr == addr {
+                peer.last_reg_time = Instant::now();
+            }
+        }
     }
 
     #[inline]
@@ -1286,31 +1390,110 @@ impl RendezvousServer {
                 tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(ws_config)),
             )
             .await??;
-            let (a, mut b) = ws_stream.split();
+            let (a, b) = ws_stream.split();
             sink = Some(Sink::Ws(a));
-            while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
-                if let tungstenite::Message::Binary(bytes) = msg {
-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
-                        break;
-                    }
-                }
-            }
+            let reader = b
+                .take_while(|msg| ready(msg.is_ok()))
+                .map(|msg| match msg {
+                    Ok(tungstenite::Message::Binary(bytes)) => Some(bytes),
+                    _ => None,
+                });
+            self.tcp_conn_loop(reader, &mut sink, addr, key, ws).await;
         } else {
             let mut framed = Framed::new(stream, BytesCodec::new());
             framed.codec_mut().set_max_packet_length(*MAX_MESSAGE);
-            let (a, mut b) = framed.split();
+            let (a, b) = framed.split();
             sink = Some(Sink::TcpStream(a));
-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
-                    break;
-                }
-            }
+            let reader = b
+                .take_while(|bytes| ready(bytes.is_ok()))
+                .map(|bytes| bytes.ok().map(BytesMut::freeze));
+            self.tcp_conn_loop(reader, &mut sink, addr, key, ws).await;
         }
         if sink.is_none() {
             self.tcp_punch.lock().await.remove(&try_into_v4(addr));
         }
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())
+    }
+
+    /// Reads the messages of one TCP/WebSocket connection. `reader` yields Some(bytes) for
+    /// a message and None for a frame without one, and ends when the connection does.
+    /// SimpleDesk: for a device registered on the connection it also sends the heartbeat
+    /// and the messages meant for the device, and forgets the connection at the end.
+    async fn tcp_conn_loop<S>(
+        &mut self,
+        reader: S,
+        sink: &mut Option<Sink>,
+        addr: SocketAddr,
+        key: &str,
+        ws: bool,
+    ) where
+        S: Stream<Item = Option<Bytes>> + Send,
+    {
+        let mut reader = Box::pin(reader);
+        let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
+        let mut conn = TcpConn {
+            tx,
+            registered: None,
+        };
+        let mut check = interval(TCP_CHECK_INTERVAL);
+        let mut last_recv = Instant::now();
+        let mut last_heartbeat = Instant::now();
+        loop {
+            tokio::select! {
+                msg = reader.next() => {
+                    let Some(msg) = msg else {
+                        break;
+                    };
+                    last_recv = Instant::now();
+                    if let Some(bytes) = msg {
+                        if !self.handle_tcp(&bytes, sink, addr, key, ws, &mut conn).await {
+                            break;
+                        }
+                    }
+                }
+                Some(bytes) = rx.recv() => {
+                    Self::send_bytes_to_sink(sink, bytes).await;
+                }
+                _ = check.tick() => {
+                    let idle = if conn.registered.is_some() {
+                        TCP_PEER_IDLE_MS
+                    } else {
+                        TCP_IDLE_MS
+                    };
+                    if last_recv.elapsed().as_millis() > idle {
+                        break;
+                    }
+                    if conn.registered.is_some()
+                        && last_heartbeat.elapsed().as_millis() >= TCP_HEARTBEAT_MS
+                    {
+                        last_heartbeat = Instant::now();
+                        Self::send_bytes_to_sink(sink, Bytes::new()).await;
+                    }
+                }
+            }
+        }
+        if conn.registered.is_some() {
+            let addr = try_into_v4(addr);
+            let mut tcp_peers = self.tcp_peers.lock().await;
+            if tcp_peers.get(&addr).is_some_and(|tx| tx.same_channel(&conn.tx)) {
+                tcp_peers.remove(&addr);
+            }
+        }
+    }
+
+    #[inline]
+    async fn send_bytes_to_sink(sink: &mut Option<Sink>, bytes: Bytes) {
+        if let Some(sink) = sink.as_mut() {
+            match sink {
+                Sink::TcpStream(s) => {
+                    allow_err!(s.send(bytes).await);
+                }
+                Sink::Ws(ws) => {
+                    allow_err!(ws.send(tungstenite::Message::Binary(bytes)).await);
+                }
+            }
+        }
     }
 
     #[inline]
@@ -1554,6 +1737,187 @@ mod tests {
         let bind_addr = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let socket = create_udp_listener(Some(bind_addr), 0, 0).await.unwrap();
         assert_eq!(socket.local_addr().unwrap().ip(), bind_addr);
+    }
+
+    // SimpleDesk: devices register over TCP/WebSocket.
+
+    static TEST_DB_LOCK: Lazy<TokioMutex<()>> = Lazy::new(|| TokioMutex::new(()));
+
+    async fn test_server(dir: &tempfile::TempDir) -> RendezvousServer {
+        let pm = {
+            let _guard = TEST_DB_LOCK.lock().await;
+            std::env::set_var("DB_URL", dir.path().join("db_v2.sqlite3"));
+            PeerMap::new().await.unwrap()
+        };
+        let (tx, _rx) = mpsc::unbounded_channel::<Data>();
+        RendezvousServer {
+            tcp_punch: Default::default(),
+            tcp_peers: Default::default(),
+            pm,
+            tx,
+            relay_servers: Default::default(),
+            relay_servers0: Default::default(),
+            rendezvous_servers: Default::default(),
+            inner: Arc::new(Inner {
+                serial: 0,
+                version: String::new(),
+                software_url: String::new(),
+                mask: None,
+                local_ip: String::new(),
+                sk: None,
+            }),
+        }
+    }
+
+    async fn serve_one(rs: &RendezvousServer, ws: bool) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let rs = rs.clone();
+        tokio::spawn(async move {
+            let (stream, addr) = listener.accept().await.unwrap();
+            rs.handle_listener(stream, addr, "", ws).await;
+        });
+        server_addr
+    }
+
+    fn register_pk_msg(id: &str) -> Bytes {
+        let mut msg = RendezvousMessage::new();
+        msg.set_register_pk(RegisterPk {
+            id: id.to_owned(),
+            uuid: Bytes::from_static(b"simpledesk-test-uuid"),
+            pk: Bytes::from(vec![7u8; 32]),
+            ..Default::default()
+        });
+        Bytes::from(msg.write_to_bytes().unwrap())
+    }
+
+    fn punch_hole_msg() -> RendezvousMessage {
+        let mut msg = RendezvousMessage::new();
+        msg.set_punch_hole(PunchHole {
+            relay_server: "relay.example".to_owned(),
+            ..Default::default()
+        });
+        msg
+    }
+
+    async fn next_tcp_msg(device: &mut Framed<TcpStream, BytesCodec>) -> RendezvousMessage {
+        let bytes = timeout(5_000, device.next()).await.unwrap().unwrap().unwrap();
+        RendezvousMessage::parse_from_bytes(&bytes).unwrap()
+    }
+
+    async fn next_ws_msg(
+        device: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
+    ) -> RendezvousMessage {
+        loop {
+            let msg = timeout(5_000, device.next()).await.unwrap().unwrap().unwrap();
+            if let tungstenite::Message::Binary(bytes) = msg {
+                return RendezvousMessage::parse_from_bytes(&bytes).unwrap();
+            }
+        }
+    }
+
+    fn assert_registered(msg: &RendezvousMessage) {
+        let res = msg.register_pk_response();
+        assert_eq!(res.result.enum_value(), Ok(register_pk_response::Result::OK));
+        assert_eq!(res.keep_alive, TCP_KEEP_ALIVE_SECS);
+    }
+
+    async fn assert_forgotten(rs: &RendezvousServer, addr: SocketAddr) {
+        for _ in 0..100 {
+            if !rs.tcp_peers.lock().await.contains_key(&addr) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the connection of {addr} was not forgotten");
+    }
+
+    #[hbb_common::tokio::test]
+    async fn device_registers_over_tcp_and_gets_messages_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let rs = test_server(&dir).await;
+        let stream = TcpStream::connect(serve_one(&rs, false).await).await.unwrap();
+        let device_addr = try_into_v4(stream.local_addr().unwrap());
+        let mut device = Framed::new(stream, BytesCodec::new());
+
+        device.send(register_pk_msg("simpledesk-tcp")).await.unwrap();
+        assert_registered(&next_tcp_msg(&mut device).await);
+        assert!(rs.tcp_peers.lock().await.contains_key(&device_addr));
+        let peer = rs.pm.get_in_memory("simpledesk-tcp").await.unwrap();
+        assert_eq!(peer.read().await.socket_addr, device_addr);
+
+        // A message for the device goes over its connection instead of UDP.
+        assert!(rs.send_to_tcp_peer(&punch_hole_msg(), device_addr).await);
+        assert!(next_tcp_msg(&mut device).await.has_punch_hole());
+
+        // The echoed heartbeat keeps the connection open.
+        device.send(Bytes::new()).await.unwrap();
+        assert!(rs.send_to_tcp_peer(&punch_hole_msg(), device_addr).await);
+        assert!(next_tcp_msg(&mut device).await.has_punch_hole());
+
+        drop(device);
+        assert_forgotten(&rs, device_addr).await;
+    }
+
+    #[hbb_common::tokio::test]
+    async fn device_registers_over_websocket_behind_proxy() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let dir = tempfile::tempdir().unwrap();
+        let rs = test_server(&dir).await;
+        let server_addr = serve_one(&rs, true).await;
+        let stream = TcpStream::connect(server_addr).await.unwrap();
+        let port = stream.local_addr().unwrap().port();
+        let mut req = format!("ws://{server_addr}/ws/id")
+            .into_client_request()
+            .unwrap();
+        // The reverse proxy passes the real address of the device.
+        req.headers_mut()
+            .insert("X-Real-IP", "203.0.113.7".parse().unwrap());
+        let (mut device, _) = tokio_tungstenite::client_async(req, stream).await.unwrap();
+        let device_addr: SocketAddr = format!("203.0.113.7:{port}").parse().unwrap();
+
+        device
+            .send(tungstenite::Message::Binary(register_pk_msg("simpledesk-ws")))
+            .await
+            .unwrap();
+        assert_registered(&next_ws_msg(&mut device).await);
+        assert!(rs.tcp_peers.lock().await.contains_key(&device_addr));
+
+        assert!(rs.send_to_tcp_peer(&punch_hole_msg(), device_addr).await);
+        assert!(next_ws_msg(&mut device).await.has_punch_hole());
+
+        device
+            .send(tungstenite::Message::Binary(Bytes::new()))
+            .await
+            .unwrap();
+        assert!(rs.send_to_tcp_peer(&punch_hole_msg(), device_addr).await);
+        assert!(next_ws_msg(&mut device).await.has_punch_hole());
+
+        drop(device);
+        assert_forgotten(&rs, device_addr).await;
+    }
+
+    #[hbb_common::tokio::test]
+    async fn unregistered_connection_closes_on_empty_message_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let rs = test_server(&dir).await;
+        let stream = TcpStream::connect(serve_one(&rs, false).await).await.unwrap();
+        let device_addr = try_into_v4(stream.local_addr().unwrap());
+        let mut device = Framed::new(stream, BytesCodec::new());
+        device.send(Bytes::new()).await.unwrap();
+        let next = timeout(5_000, device.next()).await.unwrap();
+        assert!(!matches!(next, Some(Ok(_))), "connection stayed open: {next:?}");
+        assert!(!rs.send_to_tcp_peer(&punch_hole_msg(), device_addr).await);
+    }
+
+    #[test]
+    fn ws_only_moves_other_ports_to_localhost() {
+        let any = Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        let localhost = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(internal_bind_address(any, false), any);
+        assert_eq!(internal_bind_address(None, false), None);
+        assert_eq!(internal_bind_address(any, true), localhost);
+        assert_eq!(internal_bind_address(None, true), localhost);
     }
 
     #[hbb_common::tokio::test]
