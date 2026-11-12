@@ -24,14 +24,18 @@ Gearbeitet wird jeweils auf dem Branch `simpledesk`.
 - Client: keine öffentlichen STUN-Server mehr (Google, Cloudflare und andere)
 - Client: Lizenz-Konfigurationen von RustDesk werden nicht mehr angenommen, Custom-Client-Konfigurationen nur mit SimpleDesk-Schlüssel
 - Client: Links zu rustdesk.com zeigen auf die Projektseite
+- Eigener Server läuft mit dem SimpleDesk-Image (remote.felixthedev.com)
+- Anmeldung nur über Eider (OIDC), live mit www.klg-orga.de. SimpleDesk hat keine Konten mit Benutzername und Passwort.
+- Verbinden nur mit Anmeldung (`LOGIN_REQUIRED=Y`)
 
 ## Als Nächstes
 
-1. Echter Test mit zwei Clients
-2. Eigenen Server auf das SimpleDesk-Image umstellen
-3. Client-Build und Release über GitHub Actions (zuerst Windows)
-4. Client umbenennen in SimpleDesk (Name, Icons, Installer)
+1. Client-Build und Windows-Installer über GitHub Actions (läuft)
+2. Client: Anmeldefenster beim Start, nur "Mit Eider anmelden"
+3. Echter Test mit zwei Clients
+4. Client: Icons und Installer mit SimpleDesk-Namen
 5. Client: nur noch erlaubte Server (Allowlist für klg-orga.de und felixthedev.com)
+6. Rollen: im Moment sieht jeder mit Lizenz im Panel alle Geräte
 
 ## Pro-Funktionen
 
@@ -40,9 +44,9 @@ Gearbeitet wird jeweils auf dem Branch `simpledesk`.
 | Verbindung über WebSocket/HTTPS | fertig |
 | ID ändern | fertig |
 | Eigener Client mit festen Einstellungen | Grundlage fertig (SimpleDesk-Schlüssel), Generator fehlt |
-| Web-Panel | angefangen: Einrichten, Login, Geräteliste, Adressbuch |
-| Login im Client mit Konto | fertig (Panel-Konten) |
-| Login mit 2FA | offen |
+| Web-Panel | angefangen: Anmelden über Eider, Geräteliste, Adressbuch |
+| Login im Client mit Konto | über Eider im Browser, Anmeldefenster im Client wird gebaut |
+| Login mit 2FA | über Eider |
 | Geräteverwaltung und Online-Status | Online-Status fertig, Verwalten offen |
 | Adressbuch | persönliches Adressbuch fertig (Client und Panel), geteilte offen |
 | Audit-Log (Verbindungen, Dateien, Alarme) | offen |
@@ -50,7 +54,7 @@ Gearbeitet wird jeweils auf dem Branch `simpledesk`.
 | Zentrale Einstellungen für alle Clients | offen |
 | Geräte zentral einrichten | offen |
 | Mehrere Relays, das nächste automatisch | offen |
-| OIDC (z. B. Eider, Microsoft) | SimpleDesk-Seite fertig (Panel und Client), Eider wird gerade OIDC-Anbieter |
+| OIDC (Eider) | fertig und live, einziger Weg zum Anmelden |
 | LDAP (AD) | offen |
 | SMTP für Mails | offen |
 | Web-Client selbst hosten | offen |

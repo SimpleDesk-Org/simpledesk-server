@@ -1,19 +1,13 @@
 {% extends "panel/base.html" %}
 {% block title %}Anmelden{% endblock %}
 {% block content %}
-<form class="card narrow" method="post" action="/login">
+<div class="card narrow">
   <h1>Anmelden</h1>
-  {% if !error.is_empty() %}<p class="error">{{ error }}</p>{% endif %}
-  {% if !oidc_name.is_empty() %}
+  {% if oidc_name.is_empty() %}
+  <p class="error">Die Anmeldung ist auf diesem Server noch nicht eingerichtet. Bitte sag der IT Bescheid.</p>
+  {% else %}
+  <p class="hint">Mit deinem {{ oidc_name }}-Konto. Bist du dort schon angemeldet, musst du nur bestätigen.</p>
   <a class="button" href="/oidc/login">Mit {{ oidc_name }} anmelden</a>
-  <p class="or">oder mit einem Konto dieses Servers</p>
   {% endif %}
-  <label>Benutzername
-    <input name="name" autocomplete="username" required autofocus>
-  </label>
-  <label>Passwort
-    <input name="password" type="password" autocomplete="current-password" required>
-  </label>
-  <button type="submit">Anmelden</button>
-</form>
+</div>
 {% endblock %}

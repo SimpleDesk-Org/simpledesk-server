@@ -1874,8 +1874,13 @@ mod tests {
         }
     }
 
+    /// Tests that end in record_punch_req take this, so they do not change PUNCH_REQS while
+    /// punch_reqs_bounded counts it.
+    static PUNCH_REQS_IN_USE: Lazy<TokioMutex<()>> = Lazy::new(|| TokioMutex::new(()));
+
     #[hbb_common::tokio::test]
     async fn login_required_lets_only_signed_in_users_connect() {
+        let _punch_reqs = PUNCH_REQS_IN_USE.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let mut rs = test_server_with(&dir, true).await;
         // An online device.
@@ -2143,6 +2148,7 @@ mod tests {
 
     #[hbb_common::tokio::test]
     async fn punch_reqs_bounded() {
+        let _punch_reqs = PUNCH_REQS_IN_USE.lock().await;
         let max = *PUNCH_REQ_MAX;
         // 31 ids keep every request just outside the 30-entry dedupe window;
         // one request at least, so MAX_PUNCH_REQUESTS=0 is exercised too

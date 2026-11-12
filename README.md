@@ -7,21 +7,17 @@ SimpleDesk ist ein Fork des kostenlosen RustDesk-Servers ([rustdesk/rustdesk-ser
 - Geräte können sich auch über TCP und WebSocket anmelden, nicht nur über UDP. Die Verbindung bleibt offen, der Server schickt alle 20 Sekunden ein Lebenszeichen, und Anfragen anderer Geräte kommen über diese Verbindung.
 - Neuer Schalter `WS_ONLY=Y` für hbbs und hbbr: Nur die WebSocket-Ports (21118 und 21119) lauschen auf der Bind-Adresse, alle anderen Ports nur auf 127.0.0.1. Verbindungen laufen dann immer über das Relay.
 - Ein Gerät kann seine ID ändern (`--set-id`).
-- Web-Panel in hbbs auf Port 21114: Einrichten, Anmelden, Geräteliste mit Online-Status, persönliches Adressbuch. Abschalten mit `PANEL=N`.
-- API für den Client auf demselben Port: Anmelden mit dem Panel-Konto und persönliches Adressbuch mit Einträgen und Tags. Heartbeat und Systeminfo werden ruhig beantwortet.
+- Web-Panel in hbbs auf Port 21114: Anmelden über Eider, Geräteliste mit Online-Status, persönliches Adressbuch. Abschalten mit `PANEL=N`.
+- API für den Client auf demselben Port: Anmelden über Eider im Browser und persönliches Adressbuch mit Einträgen und Tags. Heartbeat und Systeminfo werden ruhig beantwortet.
 - Neuer Schalter `LOGIN_REQUIRED=Y` (im Docker-Image Standard): Verbinden darf nur, wer im Client angemeldet ist. Der Server prüft den Token, den der Client mit jeder Verbindungsanfrage schickt. Ohne Anmeldung sieht man „Bitte melde dich in SimpleDesk an“. Das gilt auch für den normalen RustDesk-Client. Geräte, auf die man zugreift, brauchen keine Anmeldung.
-
-## Web-Panel einrichten
-
-Beim ersten Start ohne Admin schreibt hbbs einen Setup-Code ins Log, zum Beispiel `docker logs hbbs`. Auf der ersten Seite des Panels gibst du den Code ein und legst den Admin an. Danach gilt der Code nicht mehr.
 
 ## Anmeldung über Eider oder einen anderen OIDC-Anbieter
 
-Panel und Client können sich über OpenID Connect anmelden, zum Beispiel über Eider. Dann prüft der Anbieter Passwort und zweiten Faktor, SimpleDesk bekommt nur den Namen. Einstellungen für hbbs:
+Es gibt keine Konten mit Benutzername und Passwort in SimpleDesk. Panel und Client melden sich über OpenID Connect an, zum Beispiel über Eider. Der Anbieter prüft Passwort, zweiten Faktor und Lizenz, SimpleDesk bekommt nur den Namen. Einstellungen für hbbs:
 
 | Variable | Bedeutung |
 |---|---|
-| `OIDC_ISSUER` | Adresse des Anbieters, zum Beispiel `https://eider.example`. Ohne sie ist die Anmeldung über einen Anbieter aus. |
+| `OIDC_ISSUER` | Adresse des Anbieters, zum Beispiel `https://eider.example`. Ohne sie kann sich niemand anmelden. |
 | `OIDC_CLIENT_ID` | Client-ID beim Anbieter, Standard `simpledesk` |
 | `OIDC_CLIENT_SECRET` | Geheimnis des Clients beim Anbieter |
 | `OIDC_NAME` | Name auf dem Knopf, Standard `Eider` |

@@ -501,6 +501,7 @@ mod tests {
         let panel = panel_with_oidc(&dir, &provider.issuer).await;
         let login = text(call(&panel, "GET", "/login", None, None).await).await;
         assert!(login.contains("Mit Eider anmelden"), "{login}");
+        assert!(!login.contains("<input"), "{login}");
 
         // Off to the provider with PKCE, nonce and the configured redirect URI.
         let res = call(&panel, "GET", "/oidc/login", None, None).await;
@@ -522,8 +523,11 @@ mod tests {
         let cookie = set_cookie.split(';').next().unwrap().to_owned();
         let page = text(call(&panel, "GET", "/", Some(&cookie), None).await).await;
         assert!(page.contains("felix"), "{page}");
-        // The account has no password here.
-        assert!(!panel.check_password("felix", "!".to_owned()).await);
+        // The account has no password here; the client is sent to the button.
+        let body = json!({"username": "felix", "password": "!", "type": "account"});
+        let res = json_of(call(&panel, "POST", "/api/login", None, Some(body)).await).await;
+        assert!(res["error"].as_str().unwrap().contains("Mit Eider anmelden"), "{res}");
+        assert!(res.get("access_token").is_none());
 
         // A state works once.
         let res = call(&panel, "GET", &callback, None, None).await;

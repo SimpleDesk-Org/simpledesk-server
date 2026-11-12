@@ -96,7 +96,6 @@ a.button {
   border-radius: 6px;
   text-decoration: none;
 }
-.or { text-align: center; color: var(--muted); font-size: 13px; margin: 14px 0; }
 code { font-size: 13px; }
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); }

@@ -1,8 +1,8 @@
-//! SimpleDesk web panel inside hbbs: first-time setup, login and the device list.
+//! SimpleDesk web panel inside hbbs: login, the device list and the address book.
 //!
 //! It listens on the API port (port - 2, normally 21114) next to the WebSocket port, so the
-//! reverse proxy can serve it on port 443. Without an admin the server logs a setup code;
-//! only who can read the log can create the first admin.
+//! reverse proxy can serve it on port 443. There are no accounts with a password here: everybody
+//! signs in through the OIDC provider (Eider), which checks password, second factor and Lizenz.
 
 use crate::common::get_arg;
 use crate::oidc::{Oidc, OidcConfig, Purpose};
@@ -29,17 +29,9 @@ use tokio::sync::Mutex;
 
 const COOKIE_NAME: &str = "simpledesk_session";
 const SESSION_DURATION: Duration = Duration::from_secs(8 * 60 * 60);
-const MIN_PASSWORD_LEN: usize = 12;
-const MAX_NAME_LEN: usize = 100;
-// Wait after a failed login, so guessing passwords is slow.
-pub(crate) const FAILED_LOGIN_DELAY: Duration = Duration::from_secs(1);
+const MAX_ID_LEN: usize = 100;
 // Color of tags created in the panel (ARGB, the panel's blue).
 const DEFAULT_TAG_COLOR: i64 = 0xFF1F6FEB;
-#[cfg(not(test))]
-const BCRYPT_COST: u32 = 12;
-#[cfg(test)]
-const BCRYPT_COST: u32 = 4;
-const SETUP_CODE_CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 const PANEL_CSS: &str = include_str!("../templates/panel/panel.css");
 
@@ -52,25 +44,13 @@ pub(crate) struct Panel {
     pub(crate) pm: PeerMap,
     tcp_peers: TcpPeers,
     sessions: Mutex<HashMap<String, Session>>,
-    // Set while no admin exists.
-    setup_code: Mutex<Option<String>>,
-    /// Login through an OIDC provider such as Eider, if configured.
+    /// Login through an OIDC provider such as Eider. Without it nobody can sign in.
     pub(crate) oidc: Option<Oidc>,
 }
 
 impl Panel {
     pub(crate) async fn new(pm: PeerMap, tcp_peers: TcpPeers) -> ResultType<Self> {
         let _ = sodiumoxide::init();
-        let setup_code = if pm.db.count_panel_users().await? == 0 {
-            let code = new_setup_code();
-            log::info!(
-                "SimpleDesk web panel: no admin yet. Setup code: {} (enter it on the panel's first page)",
-                code
-            );
-            Some(code)
-        } else {
-            None
-        };
         let oidc = OidcConfig::from_args().and_then(|config| match Oidc::new(config) {
             Ok(oidc) => {
                 log::info!("SimpleDesk web panel: login through {} ({})", oidc.config.name, oidc.config.issuer);
@@ -81,11 +61,13 @@ impl Panel {
                 None
             }
         });
+        if oidc.is_none() {
+            log::warn!("SimpleDesk web panel: no OIDC provider (OIDC_ISSUER), so nobody can sign in");
+        }
         Ok(Self {
             pm,
             tcp_peers,
             sessions: Default::default(),
-            setup_code: Mutex::new(setup_code),
             oidc,
         })
     }
@@ -96,7 +78,7 @@ impl Panel {
         self
     }
 
-    fn oidc_name(&self) -> &str {
+    pub(crate) fn oidc_name(&self) -> &str {
         self.oidc.as_ref().map(|oidc| oidc.config.name.as_str()).unwrap_or_default()
     }
 
@@ -117,23 +99,6 @@ impl Panel {
             },
         );
         token
-    }
-
-    /// Checks a user's password; used by the panel and by the client login.
-    pub(crate) async fn check_password(&self, name: &str, password: String) -> bool {
-        let hash = match self.pm.db.get_panel_password_hash(name).await {
-            Ok(hash) => hash,
-            Err(err) => {
-                log::error!("SimpleDesk web panel: reading user failed: {}", err);
-                None
-            }
-        };
-        let Some(hash) = hash else {
-            return false;
-        };
-        tokio::task::spawn_blocking(move || bcrypt::verify(password, &hash).unwrap_or(false))
-            .await
-            .unwrap_or(false)
     }
 
     async fn ab_entries(&self, user: &str) -> ResultType<Vec<AbEntry>> {
@@ -209,16 +174,7 @@ pub(crate) struct Device {
 #[derive(Template)]
 #[template(path = "panel/login.html")]
 struct LoginPage<'a> {
-    error: &'a str,
     /// Name of the OIDC provider for the button, empty without one.
-    oidc_name: &'a str,
-}
-
-#[derive(Template)]
-#[template(path = "panel/setup.html")]
-struct SetupPage<'a> {
-    error: &'a str,
-    name: &'a str,
     oidc_name: &'a str,
 }
 
@@ -282,20 +238,6 @@ struct AbDeleteForm {
     id: String,
 }
 
-#[derive(Deserialize)]
-struct LoginForm {
-    name: String,
-    password: String,
-}
-
-#[derive(Deserialize)]
-struct SetupForm {
-    code: String,
-    name: String,
-    password: String,
-    password2: String,
-}
-
 /// Starts the panel unless PANEL=N. Errors are logged; the rest of hbbs keeps running.
 pub(crate) async fn start(bind_addr: Option<IpAddr>, port: u16, pm: PeerMap, tcp_peers: TcpPeers) {
     if get_arg("PANEL").to_uppercase() == "N" {
@@ -324,8 +266,7 @@ pub(crate) async fn start(bind_addr: Option<IpAddr>, port: u16, pm: PeerMap, tcp
 pub(crate) fn router(panel: Arc<Panel>) -> Router {
     Router::new()
         .route("/", get(index))
-        .route("/login", get(login_page).post(login))
-        .route("/setup", post(setup))
+        .route("/login", get(login_page))
         .route("/logout", post(logout))
         .route("/ab", get(ab_page))
         .route("/ab/add", post(ab_add))
@@ -400,7 +341,7 @@ async fn ab_add(
         return redirect("/login", None);
     };
     let id = form.id.trim();
-    if id.is_empty() || id.len() > MAX_NAME_LEN || id.contains(char::is_whitespace) {
+    if id.is_empty() || id.len() > MAX_ID_LEN || id.contains(char::is_whitespace) {
         let error = "Bitte eine gültige ID eingeben (ohne Leerzeichen).";
         return render_ab(&panel, &user, StatusCode::BAD_REQUEST, error).await;
     }
@@ -469,77 +410,10 @@ async fn login_page(Extension(panel): Extension<Arc<Panel>>, headers: HeaderMap)
     if panel.user(&headers).await.is_some() {
         return redirect("/", None);
     }
-    let oidc_name = panel.oidc_name();
-    if panel.setup_code.lock().await.is_some() {
-        let page = SetupPage {
-            error: "",
-            name: "",
-            oidc_name,
-        };
-        return html(StatusCode::OK, page.render());
-    }
-    html(StatusCode::OK, LoginPage { error: "", oidc_name }.render())
-}
-
-async fn login(Extension(panel): Extension<Arc<Panel>>, Form(form): Form<LoginForm>) -> Response {
-    if !panel.check_password(form.name.trim(), form.password).await {
-        tokio::time::sleep(FAILED_LOGIN_DELAY).await;
-        let page = LoginPage {
-            error: "Benutzername oder Passwort ist falsch.",
-            oidc_name: panel.oidc_name(),
-        };
-        return html(StatusCode::UNAUTHORIZED, page.render());
-    }
-    let token = panel.start_session(form.name.trim().to_owned()).await;
-    redirect("/", Some(session_cookie(&token)))
-}
-
-async fn setup(Extension(panel): Extension<Arc<Panel>>, Form(form): Form<SetupForm>) -> Response {
-    let mut setup_code = panel.setup_code.lock().await;
-    let Some(code) = setup_code.clone() else {
-        return redirect("/login", None);
+    let page = LoginPage {
+        oidc_name: panel.oidc_name(),
     };
-    let name = form.name.trim();
-    let error = if normalize_code(&form.code) != normalize_code(&code) {
-        Some("Der Setup-Code stimmt nicht. Er steht im Log des Servers.")
-    } else if name.is_empty() || name.len() > MAX_NAME_LEN {
-        Some("Bitte einen Benutzernamen eingeben.")
-    } else if form.password.chars().count() < MIN_PASSWORD_LEN {
-        Some("Das Passwort muss mindestens 12 Zeichen haben.")
-    } else if form.password != form.password2 {
-        Some("Die beiden Passwörter sind nicht gleich.")
-    } else {
-        None
-    };
-    if let Some(error) = error {
-        if normalize_code(&form.code) != normalize_code(&code) {
-            tokio::time::sleep(FAILED_LOGIN_DELAY).await;
-        }
-        let page = SetupPage {
-            error,
-            name,
-            oidc_name: panel.oidc_name(),
-        };
-        return html(StatusCode::BAD_REQUEST, page.render());
-    }
-    let password = form.password;
-    let hash = tokio::task::spawn_blocking(move || bcrypt::hash(password, BCRYPT_COST)).await;
-    let hash = match hash {
-        Ok(Ok(hash)) => hash,
-        _ => {
-            log::error!("SimpleDesk web panel: hashing the password failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Fehler beim Speichern.").into_response();
-        }
-    };
-    if let Err(err) = panel.pm.db.insert_panel_user(name, &hash).await {
-        log::error!("SimpleDesk web panel: saving the admin failed: {}", err);
-        return (StatusCode::INTERNAL_SERVER_ERROR, "Fehler beim Speichern.").into_response();
-    }
-    *setup_code = None;
-    drop(setup_code);
-    log::info!("SimpleDesk web panel: admin {} created", name);
-    let token = panel.start_session(name.to_owned()).await;
-    redirect("/", Some(session_cookie(&token)))
+    html(StatusCode::OK, page.render())
 }
 
 /// "Mit Eider anmelden": off to the provider.
@@ -676,21 +550,6 @@ fn session_token(headers: &HeaderMap) -> Option<String> {
         })
 }
 
-fn new_setup_code() -> String {
-    let chars: String = randombytes(8)
-        .iter()
-        .map(|byte| SETUP_CODE_CHARS[*byte as usize % SETUP_CODE_CHARS.len()] as char)
-        .collect();
-    format!("{}-{}", &chars[..4], &chars[4..])
-}
-
-fn normalize_code(code: &str) -> String {
-    code.chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .map(|c| c.to_ascii_uppercase())
-        .collect()
-}
-
 pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{:02x}", byte)).collect()
 }
@@ -735,44 +594,32 @@ mod tests {
         res.headers()[header::LOCATION].to_str().unwrap()
     }
 
-    fn cookie_of(res: &Response) -> String {
-        let set_cookie = res.headers()[header::SET_COOKIE].to_str().unwrap();
-        assert!(set_cookie.contains("HttpOnly") && set_cookie.contains("SameSite=Lax"));
-        set_cookie.split(';').next().unwrap().to_owned()
+    /// A session as the provider login leaves it (the login itself is tested in oidc.rs).
+    async fn signed_in(panel: &Arc<Panel>, user: &str) -> String {
+        format!("{}={}", COOKIE_NAME, panel.start_session(user.to_owned()).await)
     }
 
     #[hbb_common::tokio::test]
-    async fn setup_then_login_then_device_list() {
+    async fn no_password_login_and_device_list_needs_a_session() {
         let dir = tempfile::tempdir().unwrap();
         let panel = test_panel(&dir).await;
-        let code = panel.setup_code.lock().await.clone().unwrap();
 
-        // Without a session everything leads to the setup page.
+        // Without a session everything leads to the login page.
         let res = send(&panel, get("/", None)).await;
         assert_eq!(res.status(), StatusCode::SEE_OTHER);
         assert_eq!(location(&res), "/login");
+
+        // There is nothing to type in: no user name, no password, no setup.
         let page = body(send(&panel, get("/login", None)).await).await;
-        assert!(page.contains("Setup-Code"), "{page}");
+        assert!(!page.contains("<input") && !page.contains("Passwort"), "{page}");
+        assert!(page.contains("nicht eingerichtet"), "{page}");
+        let res = send(&panel, post_form("/login", "name=felix&password=lang-genug-123")).await;
+        assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let res = send(&panel, post_form("/setup", "code=ABCD-EFGH&name=felix")).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
 
-        // A wrong code or a short password creates no admin.
-        let res = send(&panel, post_form("/setup", "code=XXXX-XXXX&name=felix&password=lang-genug-123&password2=lang-genug-123")).await;
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-        let form = format!("code={code}&name=felix&password=kurz&password2=kurz");
-        let res = send(&panel, post_form("/setup", &form)).await;
-        assert!(body(res).await.contains("mindestens 12 Zeichen"));
-        assert_eq!(panel.pm.db.count_panel_users().await.unwrap(), 0);
-
-        // The right code creates the admin and logs in. The code works only once.
-        let lower = code.to_lowercase();
-        let form = format!("code={lower}&name=felix&password=lang-genug-123&password2=lang-genug-123");
-        let res = send(&panel, post_form("/setup", &form)).await;
-        assert_eq!(res.status(), StatusCode::SEE_OTHER);
-        let cookie = cookie_of(&res);
-        assert_eq!(panel.pm.db.count_panel_users().await.unwrap(), 1);
-        let res = send(&panel, post_form("/setup", &form)).await;
-        assert_eq!(location(&res), "/login");
-
-        // With the session the device list shows a registered device.
+        // With a session the device list shows a registered device.
+        let cookie = signed_in(&panel, "felix").await;
         panel
             .pm
             .db
@@ -792,24 +639,13 @@ mod tests {
         send(&panel, req).await;
         let res = send(&panel, get("/", Some(&cookie))).await;
         assert_eq!(location(&res), "/login");
-
-        // Login with the right password, not with a wrong one.
-        let res = send(&panel, post_form("/login", "name=felix&password=falsch")).await;
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-        let res = send(&panel, post_form("/login", "name=felix&password=lang-genug-123")).await;
-        assert_eq!(res.status(), StatusCode::SEE_OTHER);
-        let res = send(&panel, get("/", Some(&cookie_of(&res)))).await;
-        assert_eq!(res.status(), StatusCode::OK);
     }
 
     #[hbb_common::tokio::test]
     async fn address_book_page_adds_changes_and_deletes() {
         let dir = tempfile::tempdir().unwrap();
         let panel = test_panel(&dir).await;
-        let hash = bcrypt::hash("lang-genug-123", BCRYPT_COST).unwrap();
-        panel.pm.db.insert_panel_user("felix", &hash).await.unwrap();
-        let res = send(&panel, post_form("/login", "name=felix&password=lang-genug-123")).await;
-        let cookie = cookie_of(&res);
+        let cookie = signed_in(&panel, "felix").await;
         let with_cookie = |mut req: Request<Body>| {
             req.headers_mut()
                 .insert(header::COOKIE, HeaderValue::from_str(&cookie).unwrap());
@@ -847,10 +683,9 @@ mod tests {
     }
 
     #[test]
-    fn setup_code_and_cookie_helpers() {
-        let code = new_setup_code();
-        assert_eq!(code.len(), 9);
-        assert_eq!(normalize_code(&code.to_lowercase()), normalize_code(&code));
+    fn cookie_helpers() {
+        let cookie = session_cookie("abc");
+        assert!(cookie.contains("HttpOnly") && cookie.contains("Secure") && cookie.contains("SameSite=Lax"));
         let mut headers = HeaderMap::new();
         headers.insert(
             header::COOKIE,

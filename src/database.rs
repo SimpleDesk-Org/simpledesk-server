@@ -311,40 +311,14 @@ impl Database {
         Ok(())
     }
 
-    pub async fn count_panel_users(&self) -> ResultType<i64> {
-        Ok(
-            sqlx::query_scalar::<_, i64>("select count(*) from panel_user")
-                .fetch_one(self.pool.get().await?.deref_mut())
-                .await?,
-        )
-    }
-
-    pub async fn insert_panel_user(&self, name: &str, password_hash: &str) -> ResultType<()> {
-        sqlx::query("insert into panel_user(name, password_hash) values(?, ?)")
-            .bind(name)
-            .bind(password_hash)
-            .execute(self.pool.get().await?.deref_mut())
-            .await?;
-        Ok(())
-    }
-
-    /// A user who signs in through an OIDC provider such as Eider. The hash "!" matches no
-    /// password, so the account has no password login here. An existing user is kept.
+    /// A user who signs in through the OIDC provider (Eider). There is no password login, so
+    /// the old password_hash column only holds "!". An existing user is kept.
     pub async fn ensure_external_user(&self, name: &str) -> ResultType<()> {
         sqlx::query("insert or ignore into panel_user(name, password_hash) values(?, '!')")
             .bind(name)
             .execute(self.pool.get().await?.deref_mut())
             .await?;
         Ok(())
-    }
-
-    pub async fn get_panel_password_hash(&self, name: &str) -> ResultType<Option<String>> {
-        Ok(
-            sqlx::query_scalar::<_, String>("select password_hash from panel_user where name = ?")
-                .bind(name)
-                .fetch_optional(self.pool.get().await?.deref_mut())
-                .await?,
-        )
     }
 
     /// All registered devices as (id, info json, registered at), sorted by id.

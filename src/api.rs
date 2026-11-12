@@ -5,7 +5,7 @@
 //! actions answer 200 with an empty body, because the client treats any body as an error.
 
 use crate::oidc::ClientLoginState;
-use crate::panel::{hex, Panel, FAILED_LOGIN_DELAY};
+use crate::panel::{hex, Panel};
 use axum::{
     body::Bytes,
     extract::{Extension, Path, Query},
@@ -14,7 +14,7 @@ use axum::{
     routing::{any, get, post},
     Json, Router,
 };
-use hbb_common::{log, tokio};
+use hbb_common::log;
 use serde_derive::Deserialize;
 use serde_json::{json, Map, Value};
 use sodiumoxide::{crypto::hash::sha256, randombytes::randombytes};
@@ -183,31 +183,14 @@ async fn oidc_auth_query(
     }
 }
 
-#[derive(Deserialize)]
-struct LoginRequest {
-    #[serde(default)]
-    username: String,
-    #[serde(default)]
-    password: String,
-    #[serde(default)]
-    id: String,
-    #[serde(default, rename = "type")]
-    kind: String,
-}
-
-async fn login(Extension(panel): Extension<Arc<Panel>>, body: Bytes) -> Response {
-    let Ok(req) = serde_json::from_slice::<LoginRequest>(&body) else {
-        return api_error(StatusCode::BAD_REQUEST, "Ungültige Anfrage.");
+/// There is no login with user name and password: the provider (Eider) manages all accounts.
+/// A client that still asks gets a hint instead.
+async fn login(Extension(panel): Extension<Arc<Panel>>) -> Response {
+    let message = match panel.oidc_name() {
+        "" => "Die Anmeldung ist auf diesem Server noch nicht eingerichtet.".to_owned(),
+        name => format!("Anmelden geht nur über \"Mit {} anmelden\".", name),
     };
-    if !req.kind.is_empty() && req.kind != "account" {
-        return api_error(StatusCode::BAD_REQUEST, "Diese Anmeldeart gibt es noch nicht.");
-    }
-    let name = req.username.trim().to_owned();
-    if !panel.check_password(&name, req.password).await {
-        tokio::time::sleep(FAILED_LOGIN_DELAY).await;
-        return api_error(StatusCode::UNAUTHORIZED, "Benutzername oder Passwort ist falsch.");
-    }
-    token_response(&panel, &name, &req.id).await
+    api_error(StatusCode::BAD_REQUEST, &message)
 }
 
 async fn current_user(Extension(panel): Extension<Arc<Panel>>, headers: HeaderMap) -> Response {
@@ -498,12 +481,8 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
 
-    async fn panel_with_users(dir: &tempfile::TempDir) -> Arc<Panel> {
+    async fn test_panel(dir: &tempfile::TempDir) -> Arc<Panel> {
         let pm = crate::peer::test_peer_map(dir).await;
-        for name in ["felix", "kollege"] {
-            let hash = bcrypt::hash("ein-langes-passwort", 4).unwrap();
-            pm.db.insert_panel_user(name, &hash).await.unwrap();
-        }
         Arc::new(Panel::new(pm, Default::default()).await.unwrap())
     }
 
@@ -539,10 +518,11 @@ mod tests {
         assert_eq!(text(res).await, "", "{method} {path}");
     }
 
+    /// The token the client gets at the end of its login through the provider (that login
+    /// itself is tested in oidc.rs).
     async fn login(panel: &Arc<Panel>, name: &str) -> String {
-        let body = json!({"username": name, "password": "ein-langes-passwort", "id": "Felix-Work-PC",
-            "uuid": "dXVpZA==", "autoLogin": true, "type": "account", "deviceInfo": {"os": "windows"}});
-        let res = json_of(call(panel, "POST", "/api/login", None, Some(body)).await).await;
+        panel.pm.db.ensure_external_user(name).await.unwrap();
+        let res = json_of(super::token_response(panel, name, "Felix-Work-PC").await).await;
         assert_eq!(res["type"], "access_token");
         assert_eq!(res["user"]["name"], name);
         res["access_token"].as_str().unwrap().to_owned()
@@ -551,15 +531,22 @@ mod tests {
     #[hbb_common::tokio::test]
     async fn client_logs_in_and_uses_its_address_book() {
         let dir = tempfile::tempdir().unwrap();
-        let panel = panel_with_users(&dir).await;
+        let panel = test_panel(&dir).await;
 
-        // Login: wrong password, then the right one; the token works for currentUser.
+        // No login with user name and password, also not for an account that exists.
         let res = call(&panel, "GET", "/api/login-options", None, None).await;
         assert_eq!(json_of(res).await, json!([]));
-        let wrong = json!({"username": "felix", "password": "falsch", "type": "account"});
-        let res = call(&panel, "POST", "/api/login", None, Some(wrong)).await;
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-        assert!(json_of_any(res).await["error"].is_string());
+        panel.pm.db.ensure_external_user("felix").await.unwrap();
+        for password in ["", "!", "falsch"] {
+            let body = json!({"username": "felix", "password": password, "type": "account"});
+            let res = call(&panel, "POST", "/api/login", None, Some(body)).await;
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+            let res = json_of_any(res).await;
+            assert!(res["error"].as_str().unwrap().contains("nicht eingerichtet"), "{res}");
+            assert!(res.get("access_token").is_none());
+        }
+
+        // The token from the login works for currentUser.
         let token = login(&panel, "felix").await;
         let res = call(&panel, "POST", "/api/currentUser", Some(&token), Some(json!({}))).await;
         assert_eq!(json_of(res).await["name"], "felix");
@@ -628,7 +615,7 @@ mod tests {
     #[hbb_common::tokio::test]
     async fn quiet_answers_for_heartbeat_sysinfo_and_groups() {
         let dir = tempfile::tempdir().unwrap();
-        let panel = panel_with_users(&dir).await;
+        let panel = test_panel(&dir).await;
         let body = json!({"id": "Felix-Work-PC", "uuid": "dXVpZA==", "ver": 1, "modified_at": 0});
         let res = call(&panel, "POST", "/api/heartbeat", None, Some(body)).await;
         assert_eq!(json_of(res).await, json!({}));
