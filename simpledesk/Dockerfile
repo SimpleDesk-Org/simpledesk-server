@@ -13,4 +13,6 @@ COPY --from=build /src/target/release/hbbs /src/target/release/hbbr /usr/bin/
 WORKDIR /root
 # Only the WebSocket ports are reachable, everything else listens on 127.0.0.1.
 ENV WS_ONLY=Y
+# Only signed-in users may connect to a device.
+ENV LOGIN_REQUIRED=Y
 EXPOSE 21118 21119

@@ -9,6 +9,7 @@ SimpleDesk ist ein Fork des kostenlosen RustDesk-Servers ([rustdesk/rustdesk-ser
 - Ein Gerät kann seine ID ändern (`--set-id`).
 - Web-Panel in hbbs auf Port 21114: Einrichten, Anmelden, Geräteliste mit Online-Status, persönliches Adressbuch. Abschalten mit `PANEL=N`.
 - API für den Client auf demselben Port: Anmelden mit dem Panel-Konto und persönliches Adressbuch mit Einträgen und Tags. Heartbeat und Systeminfo werden ruhig beantwortet.
+- Neuer Schalter `LOGIN_REQUIRED=Y` (im Docker-Image Standard): Verbinden darf nur, wer im Client angemeldet ist. Der Server prüft den Token, den der Client mit jeder Verbindungsanfrage schickt. Ohne Anmeldung sieht man „Bitte melde dich in SimpleDesk an“. Das gilt auch für den normalen RustDesk-Client. Geräte, auf die man zugreift, brauchen keine Anmeldung.
 
 ## Web-Panel einrichten
 

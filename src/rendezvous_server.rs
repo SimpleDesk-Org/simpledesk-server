@@ -156,7 +156,13 @@ struct Inner {
     mask: Option<Ipv4Network>,
     local_ip: String,
     sk: Option<sign::SecretKey>,
+    // SimpleDesk: LOGIN_REQUIRED=Y, only signed-in users may connect to a device.
+    login_required: bool,
 }
+
+/// What a user who is not signed in sees when connecting (SimpleDesk, LOGIN_REQUIRED=Y).
+const LOGIN_REQUIRED_MESSAGE: &str =
+    "Bitte melde dich in SimpleDesk an (Konto → Anmelden), dann kannst du dich verbinden.";
 
 #[derive(Clone)]
 pub struct RendezvousServer {
@@ -234,8 +240,13 @@ impl RendezvousServer {
                 sk,
                 mask,
                 local_ip,
+                login_required: get_arg("LOGIN_REQUIRED").to_uppercase() == "Y",
             }),
         };
+        log::info!(
+            "LOGIN_REQUIRED={}",
+            if rs.inner.login_required { "Y" } else { "N" }
+        );
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
         std::env::set_var("PORT_FOR_API", port.to_string());
@@ -555,6 +566,17 @@ impl RendezvousServer {
                         );
                         return false;
                     }
+                    // SimpleDesk: a relay only for signed-in users, see handle_punch_hole_request.
+                    if !self.signed_in(&rf.token).await {
+                        log::info!("Relay to {} from {} refused: not signed in", rf.id, addr);
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_relay_response(RelayResponse {
+                            refuse_reason: LOGIN_REQUIRED_MESSAGE.to_owned(),
+                            ..Default::default()
+                        });
+                        Self::send_to_sink(sink, msg_out).await;
+                        return false;
+                    }
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
@@ -815,6 +837,12 @@ impl RendezvousServer {
         true
     }
 
+    /// SimpleDesk: whether a connection request may go on. Always, unless LOGIN_REQUIRED=Y;
+    /// then only with the access token of a signed-in user.
+    async fn signed_in(&self, token: &str) -> bool {
+        !self.inner.login_required || crate::api::token_user(&self.pm.db, token).await.is_some()
+    }
+
     /// SimpleDesk: the device echoed the heartbeat, so it is still online.
     async fn touch_tcp_peer(&self, id: &str, addr: SocketAddr) {
         if let Some(peer) = self.pm.get_in_memory(id).await {
@@ -949,6 +977,16 @@ impl RendezvousServer {
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
+                ..Default::default()
+            });
+            return Ok((msg_out, None));
+        }
+        // SimpleDesk: the client sends its access token with the request.
+        if !self.signed_in(&ph.token).await {
+            log::info!("Connection to {} from {} refused: not signed in", ph.id, addr);
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_punch_hole_response(PunchHoleResponse {
+                other_failure: LOGIN_REQUIRED_MESSAGE.to_owned(),
                 ..Default::default()
             });
             return Ok((msg_out, None));
@@ -1810,6 +1848,10 @@ mod tests {
     // SimpleDesk: devices register over TCP/WebSocket.
 
     async fn test_server(dir: &tempfile::TempDir) -> RendezvousServer {
+        test_server_with(dir, false).await
+    }
+
+    async fn test_server_with(dir: &tempfile::TempDir, login_required: bool) -> RendezvousServer {
         let pm = crate::peer::test_peer_map(dir).await;
         let (tx, _rx) = mpsc::unbounded_channel::<Data>();
         RendezvousServer {
@@ -1827,8 +1869,53 @@ mod tests {
                 mask: None,
                 local_ip: String::new(),
                 sk: None,
+                login_required,
             }),
         }
+    }
+
+    #[hbb_common::tokio::test]
+    async fn login_required_lets_only_signed_in_users_connect() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rs = test_server_with(&dir, true).await;
+        // An online device.
+        {
+            let peer = rs.pm.get_or("Felix-Home-PC").await;
+            let mut peer = peer.write().await;
+            peer.last_reg_time = Instant::now();
+            peer.socket_addr = "198.51.100.1:5000".parse().unwrap();
+        }
+        let requester: SocketAddr = "203.0.113.9:4000".parse().unwrap();
+        let request = |token: &str| PunchHoleRequest {
+            id: "Felix-Home-PC".to_owned(),
+            token: token.to_owned(),
+            ..Default::default()
+        };
+
+        // Without a token or with an unknown one: refused with the message.
+        for token in ["", "unknown-token"] {
+            let (msg, to) = rs
+                .handle_punch_hole_request(requester, request(token), "", true)
+                .await
+                .unwrap();
+            assert!(to.is_none(), "{token:?}");
+            assert_eq!(msg.punch_hole_response().other_failure, LOGIN_REQUIRED_MESSAGE);
+        }
+
+        // With the token of a signed-in user the request goes to the device.
+        rs.pm.db.ensure_external_user("felix").await.unwrap();
+        let token = "token-of-felix";
+        rs.pm
+            .db
+            .insert_api_token(&crate::api::token_hash(token), "felix", "Felix-Work-PC")
+            .await
+            .unwrap();
+        let (msg, to) = rs
+            .handle_punch_hole_request(requester, request(token), "", true)
+            .await
+            .unwrap();
+        assert_eq!(to, Some("198.51.100.1:5000".parse().unwrap()));
+        assert!(!msg.has_punch_hole_response());
     }
 
     async fn serve_one(rs: &RendezvousServer, ws: bool) -> SocketAddr {

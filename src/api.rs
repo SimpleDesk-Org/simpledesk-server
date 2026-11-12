@@ -52,8 +52,23 @@ async fn empty_page() -> Response {
     Json(json!({ "total": 0, "data": [] })).into_response()
 }
 
-fn token_hash(token: &str) -> String {
+pub(crate) fn token_hash(token: &str) -> String {
     hex(&sha256::hash(token.as_bytes()).0)
+}
+
+/// The user an access token belongs to; None for an empty, unknown or failing lookup.
+pub(crate) async fn token_user(db: &crate::database::Database, token: &str) -> Option<String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    match db.get_api_token_user(&token_hash(token)).await {
+        Ok(user) => user,
+        Err(err) => {
+            log::error!("SimpleDesk API: reading token failed: {}", err);
+            None
+        }
+    }
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
