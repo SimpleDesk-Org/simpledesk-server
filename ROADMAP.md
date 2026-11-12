@@ -40,10 +40,11 @@ Gearbeitet wird jeweils auf dem Branch `simpledesk`.
 | Verbindung über WebSocket/HTTPS | fertig |
 | ID ändern | fertig |
 | Eigener Client mit festen Einstellungen | Grundlage fertig (SimpleDesk-Schlüssel), Generator fehlt |
-| Web-Panel | angefangen: Einrichten, Login, Geräteliste |
+| Web-Panel | angefangen: Einrichten, Login, Geräteliste, Adressbuch |
+| Login im Client mit Konto | fertig (Panel-Konten) |
 | Login mit 2FA | offen |
 | Geräteverwaltung und Online-Status | Online-Status fertig, Verwalten offen |
-| Adressbuch | offen |
+| Adressbuch | persönliches Adressbuch fertig (Client und Panel), geteilte offen |
 | Audit-Log (Verbindungen, Dateien, Alarme) | offen |
 | Zugriffsrechte, Rollen Admin und Control | offen |
 | Zentrale Einstellungen für alle Clients | offen |

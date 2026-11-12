@@ -1,0 +1,6 @@
+<nav>
+  <a href="/"{% if active == "devices" %} class="active"{% endif %}>Geräte</a>
+  <a href="/ab"{% if active == "ab" %} class="active"{% endif %}>Adressbuch</a>
+  <span class="user">{{ user }}</span>
+  <form method="post" action="/logout"><button class="link" type="submit">Abmelden</button></form>
+</nav>

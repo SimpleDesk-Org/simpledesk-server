@@ -7,7 +7,8 @@ SimpleDesk ist ein Fork des kostenlosen RustDesk-Servers ([rustdesk/rustdesk-ser
 - Geräte können sich auch über TCP und WebSocket anmelden, nicht nur über UDP. Die Verbindung bleibt offen, der Server schickt alle 20 Sekunden ein Lebenszeichen, und Anfragen anderer Geräte kommen über diese Verbindung.
 - Neuer Schalter `WS_ONLY=Y` für hbbs und hbbr: Nur die WebSocket-Ports (21118 und 21119) lauschen auf der Bind-Adresse, alle anderen Ports nur auf 127.0.0.1. Verbindungen laufen dann immer über das Relay.
 - Ein Gerät kann seine ID ändern (`--set-id`).
-- Web-Panel in hbbs auf Port 21114: Einrichten, Anmelden, Geräteliste mit Online-Status. Abschalten mit `PANEL=N`.
+- Web-Panel in hbbs auf Port 21114: Einrichten, Anmelden, Geräteliste mit Online-Status, persönliches Adressbuch. Abschalten mit `PANEL=N`.
+- API für den Client auf demselben Port: Anmelden mit dem Panel-Konto und persönliches Adressbuch mit Einträgen und Tags. Heartbeat und Systeminfo werden ruhig beantwortet.
 
 ## Web-Panel einrichten
 

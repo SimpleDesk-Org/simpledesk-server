@@ -31,7 +31,9 @@ const SESSION_DURATION: Duration = Duration::from_secs(8 * 60 * 60);
 const MIN_PASSWORD_LEN: usize = 12;
 const MAX_NAME_LEN: usize = 100;
 // Wait after a failed login, so guessing passwords is slow.
-const FAILED_LOGIN_DELAY: Duration = Duration::from_secs(1);
+pub(crate) const FAILED_LOGIN_DELAY: Duration = Duration::from_secs(1);
+// Color of tags created in the panel (ARGB, the panel's blue).
+const DEFAULT_TAG_COLOR: i64 = 0xFF1F6FEB;
 #[cfg(not(test))]
 const BCRYPT_COST: u32 = 12;
 #[cfg(test)]
@@ -46,7 +48,7 @@ struct Session {
 }
 
 pub(crate) struct Panel {
-    pm: PeerMap,
+    pub(crate) pm: PeerMap,
     tcp_peers: TcpPeers,
     sessions: Mutex<HashMap<String, Session>>,
     // Set while no admin exists.
@@ -91,6 +93,56 @@ impl Panel {
             },
         );
         token
+    }
+
+    /// Checks a user's password; used by the panel and by the client login.
+    pub(crate) async fn check_password(&self, name: &str, password: String) -> bool {
+        let hash = match self.pm.db.get_panel_password_hash(name).await {
+            Ok(hash) => hash,
+            Err(err) => {
+                log::error!("SimpleDesk web panel: reading user failed: {}", err);
+                None
+            }
+        };
+        let Some(hash) = hash else {
+            return false;
+        };
+        tokio::task::spawn_blocking(move || bcrypt::verify(password, &hash).unwrap_or(false))
+            .await
+            .unwrap_or(false)
+    }
+
+    async fn ab_entries(&self, user: &str) -> ResultType<Vec<AbEntry>> {
+        let guid = self.pm.db.personal_ab(user).await?;
+        let mut entries = Vec::new();
+        for data in self.pm.db.list_ab_peers(&guid).await? {
+            let Ok(serde_json::Value::Object(peer)) = serde_json::from_str(&data) else {
+                continue;
+            };
+            let text = |key: &str| {
+                peer.get(key)
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            let tags = peer
+                .get("tags")
+                .and_then(|tags| tags.as_array())
+                .map(|tags| {
+                    tags.iter()
+                        .filter_map(|tag| tag.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            entries.push(AbEntry {
+                id: text("id"),
+                alias: text("alias"),
+                tags,
+                note: text("note"),
+            });
+        }
+        Ok(entries)
     }
 
     async fn devices(&self) -> ResultType<Vec<Device>> {
@@ -147,8 +199,41 @@ struct SetupPage<'a> {
 #[template(path = "panel/devices.html")]
 struct DevicesPage<'a> {
     user: &'a str,
+    active: &'a str,
     devices: &'a [Device],
     online: usize,
+}
+
+pub(crate) struct AbEntry {
+    pub(crate) id: String,
+    pub(crate) alias: String,
+    pub(crate) tags: String,
+    pub(crate) note: String,
+}
+
+#[derive(Template)]
+#[template(path = "panel/ab.html")]
+struct AbPage<'a> {
+    user: &'a str,
+    active: &'a str,
+    entries: &'a [AbEntry],
+    error: &'a str,
+}
+
+#[derive(Deserialize)]
+struct AbAddForm {
+    id: String,
+    #[serde(default)]
+    alias: String,
+    #[serde(default)]
+    tags: String,
+    #[serde(default)]
+    note: String,
+}
+
+#[derive(Deserialize)]
+struct AbDeleteForm {
+    id: String,
 }
 
 #[derive(Deserialize)]
@@ -196,7 +281,11 @@ pub(crate) fn router(panel: Arc<Panel>) -> Router {
         .route("/login", get(login_page).post(login))
         .route("/setup", post(setup))
         .route("/logout", post(logout))
+        .route("/ab", get(ab_page))
+        .route("/ab/add", post(ab_add))
+        .route("/ab/delete", post(ab_delete))
         .route("/panel.css", get(css))
+        .merge(crate::api::routes())
         .layer(Extension(panel))
 }
 
@@ -217,11 +306,115 @@ async fn index(Extension(panel): Extension<Arc<Panel>>, headers: HeaderMap) -> R
         StatusCode::OK,
         DevicesPage {
             user: &user,
+            active: "devices",
             devices: &devices,
             online,
         }
         .render(),
     )
+}
+
+async fn render_ab(panel: &Panel, user: &str, status: StatusCode, error: &str) -> Response {
+    match panel.ab_entries(user).await {
+        Ok(entries) => html(
+            status,
+            AbPage {
+                user,
+                active: "ab",
+                entries: &entries,
+                error,
+            }
+            .render(),
+        ),
+        Err(err) => {
+            log::error!("SimpleDesk web panel: reading the address book failed: {}", err);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Adressbuch konnte nicht gelesen werden.")
+                .into_response()
+        }
+    }
+}
+
+async fn ab_page(Extension(panel): Extension<Arc<Panel>>, headers: HeaderMap) -> Response {
+    let Some(user) = panel.user(&headers).await else {
+        return redirect("/login", None);
+    };
+    render_ab(&panel, &user, StatusCode::OK, "").await
+}
+
+/// Adds an entry to the personal address book or changes alias, tags and note of an
+/// existing one. Other fields the client stored (hash, username, ...) are kept.
+async fn ab_add(
+    Extension(panel): Extension<Arc<Panel>>,
+    headers: HeaderMap,
+    Form(form): Form<AbAddForm>,
+) -> Response {
+    let Some(user) = panel.user(&headers).await else {
+        return redirect("/login", None);
+    };
+    let id = form.id.trim();
+    if id.is_empty() || id.len() > MAX_NAME_LEN || id.contains(char::is_whitespace) {
+        let error = "Bitte eine gültige ID eingeben (ohne Leerzeichen).";
+        return render_ab(&panel, &user, StatusCode::BAD_REQUEST, error).await;
+    }
+    let tags: Vec<String> = form
+        .tags
+        .split(',')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let result: ResultType<()> = async {
+        let db = &panel.pm.db;
+        let guid = db.personal_ab(&user).await?;
+        let mut peer = match db.get_ab_peer(&guid, id).await? {
+            Some(data) => match serde_json::from_str(&data) {
+                Ok(serde_json::Value::Object(peer)) => peer,
+                _ => serde_json::Map::new(),
+            },
+            None => serde_json::Map::new(),
+        };
+        peer.insert("id".to_owned(), id.into());
+        peer.insert("alias".to_owned(), form.alias.trim().into());
+        peer.insert("tags".to_owned(), tags.clone().into());
+        peer.insert("note".to_owned(), form.note.trim().into());
+        db.upsert_ab_peer(&guid, id, &serde_json::Value::Object(peer).to_string())
+            .await?;
+        let known: Vec<String> = db
+            .list_ab_tags(&guid)
+            .await?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        for tag in tags.iter().filter(|tag| !known.contains(tag)) {
+            db.upsert_ab_tag(&guid, tag, DEFAULT_TAG_COLOR).await?;
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(err) = result {
+        log::error!("SimpleDesk web panel: saving the entry failed: {}", err);
+        return render_ab(&panel, &user, StatusCode::INTERNAL_SERVER_ERROR, "Speichern hat nicht geklappt.").await;
+    }
+    redirect("/ab", None)
+}
+
+async fn ab_delete(
+    Extension(panel): Extension<Arc<Panel>>,
+    headers: HeaderMap,
+    Form(form): Form<AbDeleteForm>,
+) -> Response {
+    let Some(user) = panel.user(&headers).await else {
+        return redirect("/login", None);
+    };
+    let result: ResultType<()> = async {
+        let guid = panel.pm.db.personal_ab(&user).await?;
+        panel.pm.db.delete_ab_peer(&guid, form.id.trim()).await
+    }
+    .await;
+    if let Err(err) = result {
+        log::error!("SimpleDesk web panel: deleting the entry failed: {}", err);
+    }
+    redirect("/ab", None)
 }
 
 async fn login_page(Extension(panel): Extension<Arc<Panel>>, headers: HeaderMap) -> Response {
@@ -235,23 +428,7 @@ async fn login_page(Extension(panel): Extension<Arc<Panel>>, headers: HeaderMap)
 }
 
 async fn login(Extension(panel): Extension<Arc<Panel>>, Form(form): Form<LoginForm>) -> Response {
-    let hash = match panel.pm.db.get_panel_password_hash(form.name.trim()).await {
-        Ok(hash) => hash,
-        Err(err) => {
-            log::error!("SimpleDesk web panel: reading user failed: {}", err);
-            None
-        }
-    };
-    let ok = match hash {
-        Some(hash) => {
-            let password = form.password;
-            tokio::task::spawn_blocking(move || bcrypt::verify(password, &hash).unwrap_or(false))
-                .await
-                .unwrap_or(false)
-        }
-        None => false,
-    };
-    if !ok {
+    if !panel.check_password(form.name.trim(), form.password).await {
         tokio::time::sleep(FAILED_LOGIN_DELAY).await;
         let page = LoginPage {
             error: "Benutzername oder Passwort ist falsch.",
@@ -383,7 +560,7 @@ fn normalize_code(code: &str) -> String {
         .collect()
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{:02x}", byte)).collect()
 }
 
@@ -492,6 +669,50 @@ mod tests {
         assert_eq!(res.status(), StatusCode::SEE_OTHER);
         let res = send(&panel, get("/", Some(&cookie_of(&res)))).await;
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[hbb_common::tokio::test]
+    async fn address_book_page_adds_changes_and_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = test_panel(&dir).await;
+        let hash = bcrypt::hash("lang-genug-123", BCRYPT_COST).unwrap();
+        panel.pm.db.insert_panel_user("felix", &hash).await.unwrap();
+        let res = send(&panel, post_form("/login", "name=felix&password=lang-genug-123")).await;
+        let cookie = cookie_of(&res);
+        let with_cookie = |mut req: Request<Body>| {
+            req.headers_mut()
+                .insert(header::COOKIE, HeaderValue::from_str(&cookie).unwrap());
+            req
+        };
+
+        // Without a session the page leads to the login.
+        assert_eq!(location(&send(&panel, get("/ab", None)).await), "/login");
+
+        let form = "id=Felix-Home-PC&alias=Zuhause&tags=Amt%2C+Server&note=B%C3%BCro";
+        let res = send(&panel, with_cookie(post_form("/ab/add", form))).await;
+        assert_eq!(location(&res), "/ab");
+        let page = body(send(&panel, get("/ab", Some(&cookie))).await).await;
+        assert!(page.contains("Felix-Home-PC") && page.contains("Zuhause"), "{page}");
+        assert!(page.contains("Amt, Server") && page.contains("Büro"), "{page}");
+
+        // The client sees the entry and its tags; a hash it stored is kept on change.
+        let guid = panel.pm.db.personal_ab("felix").await.unwrap();
+        let tags = panel.pm.db.list_ab_tags(&guid).await.unwrap();
+        assert_eq!(tags.len(), 2);
+        let stored = r#"{"id":"Felix-Home-PC","alias":"Zuhause","tags":["Amt"],"hash":"abc"}"#;
+        panel.pm.db.upsert_ab_peer(&guid, "Felix-Home-PC", stored).await.unwrap();
+        let form = "id=Felix-Home-PC&alias=Daheim&tags=Amt&note=";
+        send(&panel, with_cookie(post_form("/ab/add", form))).await;
+        let data = panel.pm.db.get_ab_peer(&guid, "Felix-Home-PC").await.unwrap().unwrap();
+        let data: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(data["alias"], "Daheim");
+        assert_eq!(data["hash"], "abc");
+
+        // An ID with spaces is refused, deleting removes the entry.
+        let res = send(&panel, with_cookie(post_form("/ab/add", "id=mit+leerzeichen"))).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        send(&panel, with_cookie(post_form("/ab/delete", "id=Felix-Home-PC"))).await;
+        assert!(panel.pm.db.list_ab_peers(&guid).await.unwrap().is_empty());
     }
 
     #[test]

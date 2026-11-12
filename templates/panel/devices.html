@@ -1,11 +1,6 @@
 {% extends "panel/base.html" %}
 {% block title %}Geräte{% endblock %}
-{% block nav %}
-<nav>
-  <span class="user">{{ user }}</span>
-  <form method="post" action="/logout"><button class="link" type="submit">Abmelden</button></form>
-</nav>
-{% endblock %}
+{% block nav %}{% include "panel/nav.html" %}{% endblock %}
 {% block content %}
 <section class="card">
   <h1>Geräte</h1>

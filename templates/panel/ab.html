@@ -1,0 +1,54 @@
+{% extends "panel/base.html" %}
+{% block title %}Adressbuch{% endblock %}
+{% block nav %}{% include "panel/nav.html" %}{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>Mein Adressbuch</h1>
+  <p class="hint">Dieselben Einträge siehst du im SimpleDesk-Client, wenn du dich dort mit diesem Konto anmeldest.</p>
+  {% if !error.is_empty() %}<p class="error">{{ error }}</p>{% endif %}
+  {% if entries.is_empty() %}
+  <p class="empty">Noch keine Einträge.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr><th>ID</th><th>Name</th><th>Tags</th><th>Notiz</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for entry in entries %}
+      <tr>
+        <td class="id">{{ entry.id }}</td>
+        <td>{{ entry.alias }}</td>
+        <td>{{ entry.tags }}</td>
+        <td>{{ entry.note }}</td>
+        <td class="actions">
+          <form method="post" action="/ab/delete">
+            <input type="hidden" name="id" value="{{ entry.id }}">
+            <button class="link danger" type="submit">Löschen</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+
+<form class="card add" method="post" action="/ab/add">
+  <h2>Eintrag hinzufügen oder ändern</h2>
+  <div class="grid">
+    <label>ID
+      <input name="id" placeholder="Felix-Home-PC" required>
+    </label>
+    <label>Name
+      <input name="alias" placeholder="Zuhause">
+    </label>
+    <label>Tags (mit Komma getrennt)
+      <input name="tags" placeholder="Amt, Server">
+    </label>
+    <label>Notiz
+      <input name="note">
+    </label>
+  </div>
+  <button type="submit">Speichern</button>
+</form>
+{% endblock %}

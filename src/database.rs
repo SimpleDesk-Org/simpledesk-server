@@ -147,15 +147,167 @@ impl Database {
     // compile-time checked macros, so building needs no sample database.
 
     async fn create_panel_tables(&self) -> ResultType<()> {
-        sqlx::query(
+        for statement in [
             "create table if not exists panel_user (
                 name varchar(100) primary key not null,
                 password_hash text not null,
                 created_at datetime not null default(current_timestamp)
             )",
+            // Tokens of logged-in clients, stored only as a hash.
+            "create table if not exists api_token (
+                token_hash varchar(64) primary key not null,
+                user varchar(100) not null,
+                device_id varchar(100) not null default '',
+                created_at datetime not null default(current_timestamp)
+            )",
+            // Address books; every user has one personal book.
+            "create table if not exists ab (
+                guid varchar(36) primary key not null,
+                owner varchar(100) not null,
+                name varchar(100) not null,
+                personal integer not null default 0
+            )",
+            "create unique index if not exists index_ab_personal on ab (owner) where personal = 1",
+            // Entries as the JSON object the client sends (id, alias, tags, note, hash, ...).
+            "create table if not exists ab_peer (
+                ab varchar(36) not null,
+                id varchar(100) not null,
+                data text not null,
+                primary key (ab, id)
+            )",
+            "create table if not exists ab_tag (
+                ab varchar(36) not null,
+                name varchar(100) not null,
+                color integer not null,
+                primary key (ab, name)
+            )",
+        ] {
+            sqlx::query(statement)
+                .execute(self.pool.get().await?.deref_mut())
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn insert_api_token(&self, token_hash: &str, user: &str, device_id: &str) -> ResultType<()> {
+        sqlx::query("insert into api_token(token_hash, user, device_id) values(?, ?, ?)")
+            .bind(token_hash)
+            .bind(user)
+            .bind(device_id)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
+    }
+
+    /// The user of a token, if the token exists and its user still exists.
+    pub async fn get_api_token_user(&self, token_hash: &str) -> ResultType<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "select t.user from api_token t join panel_user u on u.name = t.user where t.token_hash = ?",
         )
-        .execute(self.pool.get().await?.deref_mut())
+        .bind(token_hash)
+        .fetch_optional(self.pool.get().await?.deref_mut())
+        .await?)
+    }
+
+    pub async fn delete_api_token(&self, token_hash: &str) -> ResultType<()> {
+        sqlx::query("delete from api_token where token_hash = ?")
+            .bind(token_hash)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
+    }
+
+    /// The guid of the user's personal address book, created on first use.
+    pub async fn personal_ab(&self, owner: &str) -> ResultType<String> {
+        let mut conn = self.pool.get().await?;
+        let existing = sqlx::query_scalar::<_, String>(
+            "select guid from ab where owner = ? and personal = 1",
+        )
+        .bind(owner)
+        .fetch_optional(conn.deref_mut())
         .await?;
+        if let Some(guid) = existing {
+            return Ok(guid);
+        }
+        let guid = uuid::Uuid::new_v4().to_string();
+        sqlx::query("insert into ab(guid, owner, name, personal) values(?, ?, 'Mein Adressbuch', 1)")
+            .bind(&guid)
+            .bind(owner)
+            .execute(conn.deref_mut())
+            .await?;
+        Ok(guid)
+    }
+
+    pub async fn ab_owner(&self, guid: &str) -> ResultType<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>("select owner from ab where guid = ?")
+            .bind(guid)
+            .fetch_optional(self.pool.get().await?.deref_mut())
+            .await?)
+    }
+
+    /// The entries of an address book as JSON strings, sorted by id.
+    pub async fn list_ab_peers(&self, guid: &str) -> ResultType<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "select data from ab_peer where ab = ? order by id collate nocase",
+        )
+        .bind(guid)
+        .fetch_all(self.pool.get().await?.deref_mut())
+        .await?)
+    }
+
+    pub async fn get_ab_peer(&self, guid: &str, id: &str) -> ResultType<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>("select data from ab_peer where ab = ? and id = ?")
+            .bind(guid)
+            .bind(id)
+            .fetch_optional(self.pool.get().await?.deref_mut())
+            .await?)
+    }
+
+    pub async fn upsert_ab_peer(&self, guid: &str, id: &str, data: &str) -> ResultType<()> {
+        sqlx::query("insert or replace into ab_peer(ab, id, data) values(?, ?, ?)")
+            .bind(guid)
+            .bind(id)
+            .bind(data)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_ab_peer(&self, guid: &str, id: &str) -> ResultType<()> {
+        sqlx::query("delete from ab_peer where ab = ? and id = ?")
+            .bind(guid)
+            .bind(id)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
+    }
+
+    /// The tags of an address book as (name, color), sorted by name.
+    pub async fn list_ab_tags(&self, guid: &str) -> ResultType<Vec<(String, i64)>> {
+        Ok(sqlx::query_as::<_, (String, i64)>(
+            "select name, color from ab_tag where ab = ? order by name collate nocase",
+        )
+        .bind(guid)
+        .fetch_all(self.pool.get().await?.deref_mut())
+        .await?)
+    }
+
+    pub async fn upsert_ab_tag(&self, guid: &str, name: &str, color: i64) -> ResultType<()> {
+        sqlx::query("insert or replace into ab_tag(ab, name, color) values(?, ?, ?)")
+            .bind(guid)
+            .bind(name)
+            .bind(color)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_ab_tag(&self, guid: &str, name: &str) -> ResultType<()> {
+        sqlx::query("delete from ab_tag where ab = ? and name = ?")
+            .bind(guid)
+            .bind(name)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
         Ok(())
     }
 

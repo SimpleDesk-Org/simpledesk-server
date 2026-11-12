@@ -41,6 +41,15 @@ body {
 nav { display: flex; align-items: center; gap: 16px; }
 nav form { margin: 0; }
 .user { color: var(--muted); }
+nav a { color: var(--muted); text-decoration: none; }
+nav a.active, nav a:hover { color: var(--text); }
+nav a.active { font-weight: 600; }
+h2 { font-size: 16px; margin: 0 0 12px; }
+.add { margin-top: 20px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 0 16px; }
+td.actions { text-align: right; }
+td.actions form { margin: 0; }
+button.danger { color: var(--error); }
 main { max-width: 960px; margin: 32px auto; padding: 0 16px; }
 .card {
   background: var(--card);
