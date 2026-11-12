@@ -611,7 +611,7 @@ async fn logout(Extension(panel): Extension<Arc<Panel>>, headers: HeaderMap) -> 
     redirect(
         "/login",
         Some(format!(
-            "{}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0",
+            "{}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0",
             COOKIE_NAME
         )),
     )
@@ -652,9 +652,12 @@ fn redirect_to(to: &str, cookie: Option<String>) -> Response {
     res
 }
 
+/// Lax, not Strict: after the login at the provider the browser comes back from another site,
+/// and a Strict cookie set on the callback would not go along with the redirect to "/", so the
+/// login would end on the login page again. Lax still keeps the cookie off cross-site POSTs.
 fn session_cookie(token: &str) -> String {
     format!(
-        "{}={}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age={}",
+        "{}={}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={}",
         COOKIE_NAME,
         token,
         SESSION_DURATION.as_secs()
@@ -734,7 +737,7 @@ mod tests {
 
     fn cookie_of(res: &Response) -> String {
         let set_cookie = res.headers()[header::SET_COOKIE].to_str().unwrap();
-        assert!(set_cookie.contains("HttpOnly") && set_cookie.contains("SameSite=Strict"));
+        assert!(set_cookie.contains("HttpOnly") && set_cookie.contains("SameSite=Lax"));
         set_cookie.split(';').next().unwrap().to_owned()
     }
 
