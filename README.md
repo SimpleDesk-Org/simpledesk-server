@@ -14,6 +14,20 @@ SimpleDesk ist ein Fork des kostenlosen RustDesk-Servers ([rustdesk/rustdesk-ser
 
 Beim ersten Start ohne Admin schreibt hbbs einen Setup-Code ins Log, zum Beispiel `docker logs hbbs`. Auf der ersten Seite des Panels gibst du den Code ein und legst den Admin an. Danach gilt der Code nicht mehr.
 
+## Anmeldung über Eider oder einen anderen OIDC-Anbieter
+
+Panel und Client können sich über OpenID Connect anmelden, zum Beispiel über Eider. Dann prüft der Anbieter Passwort und zweiten Faktor, SimpleDesk bekommt nur den Namen. Einstellungen für hbbs:
+
+| Variable | Bedeutung |
+|---|---|
+| `OIDC_ISSUER` | Adresse des Anbieters, zum Beispiel `https://eider.example`. Ohne sie ist die Anmeldung über einen Anbieter aus. |
+| `OIDC_CLIENT_ID` | Client-ID beim Anbieter, Standard `simpledesk` |
+| `OIDC_CLIENT_SECRET` | Geheimnis des Clients beim Anbieter |
+| `OIDC_NAME` | Name auf dem Knopf, Standard `Eider` |
+| `PANEL_URL` | öffentliche Adresse des Panels, zum Beispiel `https://remote.example`. Die Rücksprung-Adresse ist `PANEL_URL/oidc/callback`. |
+
+Der Anbieter muss Discovery, den Code-Flow mit PKCE (S256) und ein ID-Token mit HS256 und dem Client-Geheimnis können. Ein Konto aus dem Anbieter hat hier kein eigenes Passwort.
+
 ## Betrieb nur über Port 443
 
 1. hbbs und hbbr mit `WS_ONLY=Y` starten.

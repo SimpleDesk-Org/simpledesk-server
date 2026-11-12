@@ -4,6 +4,10 @@
 <form class="card narrow" method="post" action="/login">
   <h1>Anmelden</h1>
   {% if !error.is_empty() %}<p class="error">{{ error }}</p>{% endif %}
+  {% if !oidc_name.is_empty() %}
+  <a class="button" href="/oidc/login">Mit {{ oidc_name }} anmelden</a>
+  <p class="or">oder mit einem Konto dieses Servers</p>
+  {% endif %}
   <label>Benutzername
     <input name="name" autocomplete="username" required autofocus>
   </label>

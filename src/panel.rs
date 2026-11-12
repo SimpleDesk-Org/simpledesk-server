@@ -5,11 +5,12 @@
 //! only who can read the log can create the first admin.
 
 use crate::common::get_arg;
+use crate::oidc::{Oidc, OidcConfig, Purpose};
 use crate::peer::PeerMap;
 use crate::rendezvous_server::{TcpPeers, REG_TIMEOUT};
 use askama::Template;
 use axum::{
-    extract::{Extension, Form},
+    extract::{Extension, Form, Query},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -53,6 +54,8 @@ pub(crate) struct Panel {
     sessions: Mutex<HashMap<String, Session>>,
     // Set while no admin exists.
     setup_code: Mutex<Option<String>>,
+    /// Login through an OIDC provider such as Eider, if configured.
+    pub(crate) oidc: Option<Oidc>,
 }
 
 impl Panel {
@@ -68,12 +71,33 @@ impl Panel {
         } else {
             None
         };
+        let oidc = OidcConfig::from_args().and_then(|config| match Oidc::new(config) {
+            Ok(oidc) => {
+                log::info!("SimpleDesk web panel: login through {} ({})", oidc.config.name, oidc.config.issuer);
+                Some(oidc)
+            }
+            Err(err) => {
+                log::error!("SimpleDesk OIDC is off: {}", err);
+                None
+            }
+        });
         Ok(Self {
             pm,
             tcp_peers,
             sessions: Default::default(),
             setup_code: Mutex::new(setup_code),
+            oidc,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_oidc(mut self, oidc: Oidc) -> Self {
+        self.oidc = Some(oidc);
+        self
+    }
+
+    fn oidc_name(&self) -> &str {
+        self.oidc.as_ref().map(|oidc| oidc.config.name.as_str()).unwrap_or_default()
     }
 
     async fn user(&self, headers: &HeaderMap) -> Option<String> {
@@ -186,6 +210,8 @@ pub(crate) struct Device {
 #[template(path = "panel/login.html")]
 struct LoginPage<'a> {
     error: &'a str,
+    /// Name of the OIDC provider for the button, empty without one.
+    oidc_name: &'a str,
 }
 
 #[derive(Template)]
@@ -193,6 +219,26 @@ struct LoginPage<'a> {
 struct SetupPage<'a> {
     error: &'a str,
     name: &'a str,
+    oidc_name: &'a str,
+}
+
+/// The end of a login through the provider that the panel does not continue: a client's
+/// login, or an error.
+#[derive(Template)]
+#[template(path = "panel/oidc_done.html")]
+struct OidcDonePage<'a> {
+    ok: bool,
+    message: &'a str,
+}
+
+#[derive(Deserialize)]
+struct CallbackQuery {
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    error: String,
 }
 
 #[derive(Template)]
@@ -284,6 +330,8 @@ pub(crate) fn router(panel: Arc<Panel>) -> Router {
         .route("/ab", get(ab_page))
         .route("/ab/add", post(ab_add))
         .route("/ab/delete", post(ab_delete))
+        .route("/oidc/login", get(oidc_login))
+        .route("/oidc/callback", get(oidc_callback))
         .route("/panel.css", get(css))
         .merge(crate::api::routes())
         .layer(Extension(panel))
@@ -421,10 +469,16 @@ async fn login_page(Extension(panel): Extension<Arc<Panel>>, headers: HeaderMap)
     if panel.user(&headers).await.is_some() {
         return redirect("/", None);
     }
+    let oidc_name = panel.oidc_name();
     if panel.setup_code.lock().await.is_some() {
-        return html(StatusCode::OK, SetupPage { error: "", name: "" }.render());
+        let page = SetupPage {
+            error: "",
+            name: "",
+            oidc_name,
+        };
+        return html(StatusCode::OK, page.render());
     }
-    html(StatusCode::OK, LoginPage { error: "" }.render())
+    html(StatusCode::OK, LoginPage { error: "", oidc_name }.render())
 }
 
 async fn login(Extension(panel): Extension<Arc<Panel>>, Form(form): Form<LoginForm>) -> Response {
@@ -432,6 +486,7 @@ async fn login(Extension(panel): Extension<Arc<Panel>>, Form(form): Form<LoginFo
         tokio::time::sleep(FAILED_LOGIN_DELAY).await;
         let page = LoginPage {
             error: "Benutzername oder Passwort ist falsch.",
+            oidc_name: panel.oidc_name(),
         };
         return html(StatusCode::UNAUTHORIZED, page.render());
     }
@@ -460,7 +515,12 @@ async fn setup(Extension(panel): Extension<Arc<Panel>>, Form(form): Form<SetupFo
         if normalize_code(&form.code) != normalize_code(&code) {
             tokio::time::sleep(FAILED_LOGIN_DELAY).await;
         }
-        return html(StatusCode::BAD_REQUEST, SetupPage { error, name }.render());
+        let page = SetupPage {
+            error,
+            name,
+            oidc_name: panel.oidc_name(),
+        };
+        return html(StatusCode::BAD_REQUEST, page.render());
     }
     let password = form.password;
     let hash = tokio::task::spawn_blocking(move || bcrypt::hash(password, BCRYPT_COST)).await;
@@ -480,6 +540,64 @@ async fn setup(Extension(panel): Extension<Arc<Panel>>, Form(form): Form<SetupFo
     log::info!("SimpleDesk web panel: admin {} created", name);
     let token = panel.start_session(name.to_owned()).await;
     redirect("/", Some(session_cookie(&token)))
+}
+
+/// "Mit Eider anmelden": off to the provider.
+async fn oidc_login(Extension(panel): Extension<Arc<Panel>>) -> Response {
+    let Some(oidc) = panel.oidc.as_ref() else {
+        return redirect("/login", None);
+    };
+    match oidc.start(Purpose::Panel).await {
+        Ok(url) => redirect_to(&url, None),
+        Err(err) => {
+            log::error!("SimpleDesk OIDC: starting the login failed: {}", err);
+            oidc_done(false, "Die Anmeldung ist gerade nicht erreichbar. Bitte später noch einmal.")
+        }
+    }
+}
+
+/// The provider sends the browser back here, for the panel and for clients.
+async fn oidc_callback(
+    Extension(panel): Extension<Arc<Panel>>,
+    Query(query): Query<CallbackQuery>,
+) -> Response {
+    let Some(oidc) = panel.oidc.as_ref() else {
+        return redirect("/login", None);
+    };
+    if !query.error.is_empty() || query.code.is_empty() || query.state.is_empty() {
+        return oidc_done(false, "Die Anmeldung wurde abgebrochen oder abgelehnt.");
+    }
+    let (user, purpose) = match oidc.finish(&query.code, &query.state).await {
+        Ok(done) => done,
+        Err(err) => {
+            log::warn!("SimpleDesk OIDC: login failed: {}", err);
+            return oidc_done(false, "Die Anmeldung hat nicht geklappt. Bitte noch einmal versuchen.");
+        }
+    };
+    // An account from the provider has no password of its own here.
+    if let Err(err) = panel.pm.db.ensure_external_user(&user).await {
+        log::error!("SimpleDesk OIDC: saving user {} failed: {}", user, err);
+        return oidc_done(false, "Fehler beim Speichern.");
+    }
+    match purpose {
+        Purpose::Panel => {
+            log::info!("SimpleDesk web panel: {} signed in through {}", user, oidc.config.name);
+            let token = panel.start_session(user).await;
+            redirect("/", Some(session_cookie(&token)))
+        }
+        Purpose::Client(code) => {
+            if oidc.client_login_done(&code, &user).await {
+                oidc_done(true, "Du bist angemeldet. Du kannst dieses Fenster schließen und zu SimpleDesk zurückgehen.")
+            } else {
+                oidc_done(false, "Die Anmeldung hat zu lange gedauert. Bitte im Programm noch einmal starten.")
+            }
+        }
+    }
+}
+
+fn oidc_done(ok: bool, message: &str) -> Response {
+    let status = if ok { StatusCode::OK } else { StatusCode::BAD_REQUEST };
+    html(status, OidcDonePage { ok, message }.render())
 }
 
 async fn logout(Extension(panel): Extension<Arc<Panel>>, headers: HeaderMap) -> Response {
@@ -515,9 +633,15 @@ fn html(status: StatusCode, page: askama::Result<String>) -> Response {
 }
 
 fn redirect(to: &'static str, cookie: Option<String>) -> Response {
+    redirect_to(to, cookie)
+}
+
+fn redirect_to(to: &str, cookie: Option<String>) -> Response {
+    let Ok(location) = HeaderValue::from_str(to) else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Ungültige Weiterleitung.").into_response();
+    };
     let mut res = StatusCode::SEE_OTHER.into_response();
-    res.headers_mut()
-        .insert(header::LOCATION, HeaderValue::from_static(to));
+    res.headers_mut().insert(header::LOCATION, location);
     if let Some(cookie) = cookie.and_then(|cookie| HeaderValue::from_str(&cookie).ok()) {
         res.headers_mut().insert(header::SET_COOKIE, cookie);
     }

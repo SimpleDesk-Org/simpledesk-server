@@ -4,6 +4,7 @@
 //! src/hbbs_http/), not from any closed server. Errors are `{"error": "..."}`; address book
 //! actions answer 200 with an empty body, because the client treats any body as an error.
 
+use crate::oidc::ClientLoginState;
 use crate::panel::{hex, Panel, FAILED_LOGIN_DELAY};
 use axum::{
     body::Bytes,
@@ -25,6 +26,8 @@ pub(crate) fn routes() -> Router {
     Router::new()
         .route("/api/login-options", get(login_options))
         .route("/api/login", post(login))
+        .route("/api/oidc/auth", post(oidc_auth))
+        .route("/api/oidc/auth-query", get(oidc_auth_query))
         .route("/api/currentUser", post(current_user))
         .route("/api/logout", post(logout))
         .route("/api/ab/*rest", any(address_book))
@@ -89,8 +92,80 @@ fn user_json(name: &str) -> Value {
     })
 }
 
-async fn login_options() -> Response {
-    Json(json!([])).into_response()
+/// The client shows a button for every "oidc/<name>".
+async fn login_options(Extension(panel): Extension<Arc<Panel>>) -> Response {
+    match panel.oidc.as_ref() {
+        Some(oidc) => Json(json!([format!("oidc/{}", oidc.config.name)])).into_response(),
+        None => Json(json!([])).into_response(),
+    }
+}
+
+/// A new token for a signed-in user, as the answer the client expects after a login.
+async fn token_response(panel: &Panel, name: &str, device_id: &str) -> Response {
+    let token = hex(&randombytes(32));
+    if let Err(err) = panel
+        .pm
+        .db
+        .insert_api_token(&token_hash(&token), name, device_id)
+        .await
+    {
+        log::error!("SimpleDesk API: saving token failed: {}", err);
+        return api_error(StatusCode::BAD_REQUEST, "Serverfehler.");
+    }
+    log::info!("SimpleDesk API: {} logged in on device {}", name, device_id);
+    Json(json!({
+        "type": "access_token",
+        "access_token": token,
+        "user": user_json(name),
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct OidcAuthRequest {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    uuid: String,
+}
+
+/// The client starts a login in the browser: its code and the address to open.
+async fn oidc_auth(Extension(panel): Extension<Arc<Panel>>, body: Bytes) -> Response {
+    let Some(oidc) = panel.oidc.as_ref() else {
+        return api_error(StatusCode::NOT_FOUND, "Anmeldung im Browser ist nicht eingerichtet.");
+    };
+    let Ok(req) = serde_json::from_slice::<OidcAuthRequest>(&body) else {
+        return api_error(StatusCode::BAD_REQUEST, "Ungültige Anfrage.");
+    };
+    match oidc.start_client_login(&req.id, &req.uuid).await {
+        Ok((code, url)) => Json(json!({ "code": code, "url": url })).into_response(),
+        Err(err) => {
+            log::error!("SimpleDesk OIDC: starting a client login failed: {}", err);
+            api_error(StatusCode::BAD_REQUEST, "Die Anmeldung ist gerade nicht erreichbar.")
+        }
+    }
+}
+
+/// The client asks every second whether its login in the browser is done. While it is not,
+/// the answer must be exactly this error, or the client stops asking.
+async fn oidc_auth_query(
+    Extension(panel): Extension<Arc<Panel>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(oidc) = panel.oidc.as_ref() else {
+        return api_error(StatusCode::NOT_FOUND, "Anmeldung im Browser ist nicht eingerichtet.");
+    };
+    let field = |name: &str| query.get(name).map(String::as_str).unwrap_or_default();
+    match oidc
+        .client_login_state(field("code"), field("id"), field("uuid"))
+        .await
+    {
+        ClientLoginState::Waiting => Json(json!({ "error": "No authed oidc is found" })).into_response(),
+        ClientLoginState::Done(user) => token_response(&panel, &user, field("id")).await,
+        ClientLoginState::Unknown => {
+            api_error(StatusCode::BAD_REQUEST, "Die Anmeldung ist abgelaufen. Bitte noch einmal starten.")
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -117,23 +192,7 @@ async fn login(Extension(panel): Extension<Arc<Panel>>, body: Bytes) -> Response
         tokio::time::sleep(FAILED_LOGIN_DELAY).await;
         return api_error(StatusCode::UNAUTHORIZED, "Benutzername oder Passwort ist falsch.");
     }
-    let token = hex(&randombytes(32));
-    if let Err(err) = panel
-        .pm
-        .db
-        .insert_api_token(&token_hash(&token), &name, &req.id)
-        .await
-    {
-        log::error!("SimpleDesk API: saving token failed: {}", err);
-        return api_error(StatusCode::BAD_REQUEST, "Serverfehler.");
-    }
-    log::info!("SimpleDesk API: {} logged in on device {}", name, req.id);
-    Json(json!({
-        "type": "access_token",
-        "access_token": token,
-        "user": user_json(&name),
-    }))
-    .into_response()
+    token_response(&panel, &name, &req.id).await
 }
 
 async fn current_user(Extension(panel): Extension<Arc<Panel>>, headers: HeaderMap) -> Response {

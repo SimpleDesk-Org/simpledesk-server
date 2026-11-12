@@ -1,0 +1,9 @@
+{% extends "panel/base.html" %}
+{% block title %}Anmeldung{% endblock %}
+{% block content %}
+<section class="card narrow">
+  <h1>{% if ok %}Angemeldet{% else %}Anmeldung nicht möglich{% endif %}</h1>
+  <p class="{% if ok %}hint{% else %}error{% endif %}">{{ message }}</p>
+  {% if !ok %}<p><a href="/login">Zur Anmeldung</a></p>{% endif %}
+</section>
+{% endblock %}

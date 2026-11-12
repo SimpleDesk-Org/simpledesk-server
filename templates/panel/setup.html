@@ -5,6 +5,10 @@
   <h1>SimpleDesk einrichten</h1>
   <p class="hint">Lege den ersten Admin an. Den Setup-Code findest du im Log des Servers, zum Beispiel mit <code>docker logs hbbs</code>.</p>
   {% if !error.is_empty() %}<p class="error">{{ error }}</p>{% endif %}
+  {% if !oidc_name.is_empty() %}
+  <a class="button" href="/oidc/login">Mit {{ oidc_name }} anmelden</a>
+  <p class="or">oder hier einen eigenen Admin anlegen</p>
+  {% endif %}
   <label>Setup-Code
     <input name="code" placeholder="XXXX-XXXX" autocomplete="off" required autofocus>
   </label>

@@ -50,7 +50,8 @@ Gearbeitet wird jeweils auf dem Branch `simpledesk`.
 | Zentrale Einstellungen für alle Clients | offen |
 | Geräte zentral einrichten | offen |
 | Mehrere Relays, das nächste automatisch | offen |
-| OIDC (z. B. Microsoft) und LDAP (AD) | offen |
+| OIDC (z. B. Eider, Microsoft) | SimpleDesk-Seite fertig (Panel und Client), Eider wird gerade OIDC-Anbieter |
+| LDAP (AD) | offen |
 | SMTP für Mails | offen |
 | Web-Client selbst hosten | offen |
 
