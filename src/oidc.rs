@@ -280,14 +280,15 @@ impl Oidc {
         Ok((code, url))
     }
 
-    /// The browser login for a client is done.
-    pub(crate) async fn client_login_done(&self, code: &str, user: &str) -> bool {
+    /// The browser login for a client is done. Returns the device ID, so the page can name the
+    /// device that is now signed in; None if the client login is unknown or expired.
+    pub(crate) async fn client_login_done(&self, code: &str, user: &str) -> Option<String> {
         match self.client_logins.lock().await.get_mut(code) {
             Some(login) if login.started.elapsed() < CLIENT_LOGIN_LIFETIME => {
                 login.user = Some(user.to_owned());
-                true
+                Some(login.device_id.clone())
             }
-            _ => false,
+            _ => None,
         }
     }
 
@@ -568,7 +569,8 @@ mod tests {
         let callback = format!("/oidc/callback?code=code-3&state={state}");
         let res = call(&panel, "GET", &callback, None, None).await;
         assert_eq!(res.status(), StatusCode::OK);
-        assert!(text(res).await.contains("angemeldet"));
+        let page = text(res).await;
+        assert!(page.contains("Das Gerät Felix-Work-PC ist jetzt mit deinem Konto angemeldet"), "{page}");
 
         // The client gets its token once, and the token works.
         let done = json_of(call(&panel, "GET", &query_path, None, None).await).await;

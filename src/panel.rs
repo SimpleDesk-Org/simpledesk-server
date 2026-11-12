@@ -585,13 +585,17 @@ async fn oidc_callback(
             let token = panel.start_session(user).await;
             redirect("/", Some(session_cookie(&token)))
         }
-        Purpose::Client(code) => {
-            if oidc.client_login_done(&code, &user).await {
-                oidc_done(true, "Du bist angemeldet. Du kannst dieses Fenster schließen und zu SimpleDesk zurückgehen.")
-            } else {
-                oidc_done(false, "Die Anmeldung hat zu lange gedauert. Bitte im Programm noch einmal starten.")
-            }
-        }
+        Purpose::Client(code) => match oidc.client_login_done(&code, &user).await {
+            // Naming the device makes a login for somebody else's device stand out.
+            Some(device) => oidc_done(
+                true,
+                &format!(
+                    "Das Gerät {} ist jetzt mit deinem Konto angemeldet. Du kannst dieses Fenster schließen. Ist das nicht dein Gerät, sag bitte sofort der IT Bescheid.",
+                    device
+                ),
+            ),
+            None => oidc_done(false, "Die Anmeldung hat zu lange gedauert. Bitte im Programm noch einmal starten."),
+        },
     }
 }
 
