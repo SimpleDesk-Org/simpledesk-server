@@ -210,3 +210,15 @@ impl PeerMap {
         self.map.read().await.contains_key(id)
     }
 }
+
+/// SimpleDesk tests: a PeerMap on its own database in `dir`. PeerMap::new reads DB_URL from
+/// the environment, which all tests share, so creating one is serialized.
+#[cfg(test)]
+pub(crate) async fn test_peer_map(dir: &tempfile::TempDir) -> PeerMap {
+    lazy_static::lazy_static! {
+        static ref TEST_DB_LOCK: Mutex<()> = Mutex::new(());
+    }
+    let _guard = TEST_DB_LOCK.lock().await;
+    std::env::set_var("DB_URL", dir.path().join("db_v2.sqlite3"));
+    PeerMap::new().await.unwrap()
+}

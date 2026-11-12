@@ -6,13 +6,19 @@ SimpleDesk ist ein Fork des kostenlosen RustDesk-Servers ([rustdesk/rustdesk-ser
 
 - Geräte können sich auch über TCP und WebSocket anmelden, nicht nur über UDP. Die Verbindung bleibt offen, der Server schickt alle 20 Sekunden ein Lebenszeichen, und Anfragen anderer Geräte kommen über diese Verbindung.
 - Neuer Schalter `WS_ONLY=Y` für hbbs und hbbr: Nur die WebSocket-Ports (21118 und 21119) lauschen auf der Bind-Adresse, alle anderen Ports nur auf 127.0.0.1. Verbindungen laufen dann immer über das Relay.
+- Ein Gerät kann seine ID ändern (`--set-id`).
+- Web-Panel in hbbs auf Port 21114: Einrichten, Anmelden, Geräteliste mit Online-Status. Abschalten mit `PANEL=N`.
+
+## Web-Panel einrichten
+
+Beim ersten Start ohne Admin schreibt hbbs einen Setup-Code ins Log, zum Beispiel `docker logs hbbs`. Auf der ersten Seite des Panels gibst du den Code ein und legst den Admin an. Danach gilt der Code nicht mehr.
 
 ## Betrieb nur über Port 443
 
 1. hbbs und hbbr mit `WS_ONLY=Y` starten.
-2. Einen Reverse Proxy mit HTTPS davorsetzen: `/ws/id` an Port 21118, `/ws/relay` an Port 21119. Der Proxy muss `X-Real-IP` setzen.
-3. Die Ports 21118 und 21119 dürfen nur für den Proxy erreichbar sein, nicht aus dem Internet. Der Server übernimmt die IP aus `X-Real-IP` ungeprüft.
-4. In jedem RustDesk-Client `allow-websocket` auf `Y` setzen und als API-Server `https://<deine Domain>` eintragen.
+2. Einen Reverse Proxy mit HTTPS davorsetzen: `/ws/id` an Port 21118, `/ws/relay` an Port 21119 und alles andere (`/`) an Port 21114 für das Web-Panel. Der Proxy muss `X-Real-IP` setzen.
+3. Die Ports 21114, 21118 und 21119 dürfen nur für den Proxy erreichbar sein, nicht aus dem Internet. Der Server übernimmt die IP aus `X-Real-IP` ungeprüft.
+4. In jedem RustDesk-Client `allow-websocket` auf `Y` setzen und als API-Server `https://<deine Domain>` eintragen. Der SimpleDesk-Client hat das schon eingebaut.
 
 ---
 

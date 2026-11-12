@@ -1,0 +1,15 @@
+{% extends "panel/base.html" %}
+{% block title %}Anmelden{% endblock %}
+{% block content %}
+<form class="card narrow" method="post" action="/login">
+  <h1>Anmelden</h1>
+  {% if !error.is_empty() %}<p class="error">{{ error }}</p>{% endif %}
+  <label>Benutzername
+    <input name="name" autocomplete="username" required autofocus>
+  </label>
+  <label>Passwort
+    <input name="password" type="password" autocomplete="current-password" required>
+  </label>
+  <button type="submit">Anmelden</button>
+</form>
+{% endblock %}

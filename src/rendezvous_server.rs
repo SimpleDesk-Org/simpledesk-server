@@ -48,7 +48,7 @@ enum Data {
     RelayServers(RelayServers),
 }
 
-const REG_TIMEOUT: i64 = 30_000;
+pub(crate) const REG_TIMEOUT: i64 = 30_000;
 // SimpleDesk: devices may register over TCP/WebSocket. The connection stays open, the
 // server sends an empty heartbeat and the device echoes it, which keeps it online.
 const TCP_HEARTBEAT_MS: u128 = 20_000;
@@ -60,7 +60,7 @@ const TCP_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 // Told to the device in seconds; it reconnects after 1.5 times this without a message.
 const TCP_KEEP_ALIVE_SECS: i32 = 30;
 // Open connections of devices registered over TCP/WebSocket, by their peer address.
-type TcpPeers = Arc<Mutex<HashMap<SocketAddr, mpsc::UnboundedSender<Bytes>>>>;
+pub(crate) type TcpPeers = Arc<Mutex<HashMap<SocketAddr, mpsc::UnboundedSender<Bytes>>>>;
 // SimpleDesk: state of one TCP/WebSocket connection.
 struct TcpConn {
     // Messages for the device registered on this connection.
@@ -240,6 +240,13 @@ impl RendezvousServer {
         log::info!("local-ip: {:?}", rs.inner.local_ip);
         std::env::set_var("PORT_FOR_API", port.to_string());
         rs.parse_relay_servers(&get_arg("relay-servers"));
+        // SimpleDesk: web panel on the API port (port - 2), reachable like the WebSocket port.
+        tokio::spawn(crate::panel::start(
+            bind_addr,
+            (port - 2) as u16,
+            rs.pm.clone(),
+            rs.tcp_peers.clone(),
+        ));
         let mut listener = create_tcp_listener(internal_addr, port).await?;
         let mut listener2 = create_tcp_listener(internal_addr, nat_port).await?;
         let mut listener3 = create_tcp_listener(bind_addr, ws_port).await?;
@@ -1524,11 +1531,21 @@ impl RendezvousServer {
                 }
             }
         }
-        if conn.registered.is_some() {
+        if let Some(id) = conn.registered.take() {
             let addr = try_into_v4(addr);
-            let mut tcp_peers = self.tcp_peers.lock().await;
-            if tcp_peers.get(&addr).is_some_and(|tx| tx.same_channel(&conn.tx)) {
-                tcp_peers.remove(&addr);
+            {
+                let mut tcp_peers = self.tcp_peers.lock().await;
+                if tcp_peers.get(&addr).is_some_and(|tx| tx.same_channel(&conn.tx)) {
+                    tcp_peers.remove(&addr);
+                }
+            }
+            // Without its connection the device cannot be reached, so it is offline now and
+            // not only after REG_TIMEOUT. Unless it registered again on another connection.
+            if let Some(peer) = self.pm.get_in_memory(&id).await {
+                let mut peer = peer.write().await;
+                if peer.socket_addr == addr {
+                    peer.last_reg_time = get_expired_time();
+                }
             }
         }
     }
@@ -1792,14 +1809,8 @@ mod tests {
 
     // SimpleDesk: devices register over TCP/WebSocket.
 
-    static TEST_DB_LOCK: Lazy<TokioMutex<()>> = Lazy::new(|| TokioMutex::new(()));
-
     async fn test_server(dir: &tempfile::TempDir) -> RendezvousServer {
-        let pm = {
-            let _guard = TEST_DB_LOCK.lock().await;
-            std::env::set_var("DB_URL", dir.path().join("db_v2.sqlite3"));
-            PeerMap::new().await.unwrap()
-        };
+        let pm = crate::peer::test_peer_map(dir).await;
         let (tx, _rx) = mpsc::unbounded_channel::<Data>();
         RendezvousServer {
             tcp_punch: Default::default(),
@@ -1929,9 +1940,19 @@ mod tests {
         device.send(Bytes::new()).await.unwrap();
         assert!(rs.send_to_tcp_peer(&punch_hole_msg(), device_addr).await);
         assert!(next_tcp_msg(&mut device).await.has_punch_hole());
+        let online = |peer: &Peer| (peer.last_reg_time.elapsed().as_millis() as i64) < REG_TIMEOUT;
+        assert!(online(&*peer.read().await));
 
+        // Without its connection the device is offline at once.
         drop(device);
         assert_forgotten(&rs, device_addr).await;
+        for _ in 0..100 {
+            if !online(&*peer.read().await) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!online(&*peer.read().await));
     }
 
     #[hbb_common::tokio::test]

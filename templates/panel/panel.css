@@ -1,0 +1,90 @@
+:root {
+  --bg: #f4f6f8;
+  --card: #ffffff;
+  --text: #1d2733;
+  --muted: #5d6b7a;
+  --line: #dde3ea;
+  --accent: #1f6feb;
+  --on: #1a9c4b;
+  --off: #a7b1bc;
+  --error: #c62828;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #11161c;
+    --card: #1a212a;
+    --text: #e6edf3;
+    --muted: #9aa7b4;
+    --line: #2b3540;
+    --accent: #4f8ff7;
+    --on: #3fbf6f;
+    --off: #5c6773;
+    --error: #ef6461;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+.top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 20px;
+  background: var(--card);
+  border-bottom: 1px solid var(--line);
+}
+.brand { font-weight: 700; font-size: 17px; }
+nav { display: flex; align-items: center; gap: 16px; }
+nav form { margin: 0; }
+.user { color: var(--muted); }
+main { max-width: 960px; margin: 32px auto; padding: 0 16px; }
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 24px;
+}
+.narrow { max-width: 380px; margin: 40px auto; }
+h1 { font-size: 20px; margin: 0 0 12px; }
+.hint { color: var(--muted); margin: 0 0 16px; }
+.error { color: var(--error); margin: 0 0 12px; }
+.empty { color: var(--muted); }
+label { display: block; margin: 0 0 14px; font-weight: 600; font-size: 14px; }
+input {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+  padding: 9px 10px;
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+input:focus { outline: 2px solid var(--accent); border-color: transparent; }
+button {
+  padding: 9px 16px;
+  font: inherit;
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent);
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+button.link { padding: 0; color: var(--accent); background: none; font-weight: 400; }
+code { font-size: 13px; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); }
+th { color: var(--muted); font-weight: 600; font-size: 13px; }
+td.id { font-weight: 600; }
+.dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 7px; }
+.dot.on { background: var(--on); }
+.dot.off { background: var(--off); }
+@media (max-width: 640px) {
+  th:nth-child(5), td:nth-child(5) { display: none; }
+}

@@ -1,0 +1,34 @@
+{% extends "panel/base.html" %}
+{% block title %}Geräte{% endblock %}
+{% block nav %}
+<nav>
+  <span class="user">{{ user }}</span>
+  <form method="post" action="/logout"><button class="link" type="submit">Abmelden</button></form>
+</nav>
+{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>Geräte</h1>
+  <p class="hint">{% if devices.len() == 1 %}1 Gerät{% else %}{{ devices.len() }} Geräte{% endif %}, davon {{ online }} online.</p>
+  {% if devices.is_empty() %}
+  <p class="empty">Noch kein Gerät hat sich bei diesem Server angemeldet.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr><th>ID</th><th>Status</th><th>Verbindung</th><th>IP</th><th>Angemeldet seit (UTC)</th></tr>
+    </thead>
+    <tbody>
+      {% for device in devices %}
+      <tr>
+        <td class="id">{{ device.id }}</td>
+        <td>{% if device.online %}<span class="dot on"></span>online{% else %}<span class="dot off"></span>offline{% endif %}</td>
+        <td>{% if device.online %}{% if device.websocket %}WebSocket (443){% else %}UDP{% endif %}{% else %}–{% endif %}</td>
+        <td>{{ device.ip }}</td>
+        <td>{{ device.registered }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+{% endblock %}

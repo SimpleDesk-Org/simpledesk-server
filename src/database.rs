@@ -64,6 +64,7 @@ impl Database {
         let _ = pool.get().await?; // test
         let db = Database { pool };
         db.create_tables().await?;
+        db.create_panel_tables().await?;
         Ok(db)
     }
 
@@ -140,6 +141,57 @@ impl Database {
         .execute(self.pool.get().await?.deref_mut())
         .await?;
         Ok(())
+    }
+
+    // SimpleDesk: tables and queries of the web panel. They use sqlx::query without the
+    // compile-time checked macros, so building needs no sample database.
+
+    async fn create_panel_tables(&self) -> ResultType<()> {
+        sqlx::query(
+            "create table if not exists panel_user (
+                name varchar(100) primary key not null,
+                password_hash text not null,
+                created_at datetime not null default(current_timestamp)
+            )",
+        )
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(())
+    }
+
+    pub async fn count_panel_users(&self) -> ResultType<i64> {
+        Ok(
+            sqlx::query_scalar::<_, i64>("select count(*) from panel_user")
+                .fetch_one(self.pool.get().await?.deref_mut())
+                .await?,
+        )
+    }
+
+    pub async fn insert_panel_user(&self, name: &str, password_hash: &str) -> ResultType<()> {
+        sqlx::query("insert into panel_user(name, password_hash) values(?, ?)")
+            .bind(name)
+            .bind(password_hash)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_panel_password_hash(&self, name: &str) -> ResultType<Option<String>> {
+        Ok(
+            sqlx::query_scalar::<_, String>("select password_hash from panel_user where name = ?")
+                .bind(name)
+                .fetch_optional(self.pool.get().await?.deref_mut())
+                .await?,
+        )
+    }
+
+    /// All registered devices as (id, info json, registered at), sorted by id.
+    pub async fn list_peers(&self) -> ResultType<Vec<(String, String, String)>> {
+        Ok(sqlx::query_as::<_, (String, String, String)>(
+            "select id, info, cast(created_at as text) from peer order by id collate nocase",
+        )
+        .fetch_all(self.pool.get().await?.deref_mut())
+        .await?)
     }
 }
 
