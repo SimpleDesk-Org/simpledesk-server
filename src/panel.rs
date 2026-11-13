@@ -88,7 +88,7 @@ impl Panel {
     }
 
     /// For admins: what the banner "Neue Version verfügbar" says, '' for no banner.
-    async fn update_notice(&self, user: &str) -> String {
+    pub(crate) async fn update_notice(&self, user: &str) -> String {
         if self.pm.accounts.is_admin(user) {
             self.update.notice().await
         } else {
@@ -118,7 +118,7 @@ impl Panel {
     }
 
     /// A new session for the user; the database keeps only its hash.
-    async fn start_session(&self, user: &str) -> ResultType<String> {
+    pub(crate) async fn start_session(&self, user: &str) -> ResultType<String> {
         let accounts = &self.pm.accounts;
         if let Err(err) = self
             .pm
@@ -663,6 +663,8 @@ pub(crate) fn router(panel: Arc<Panel>) -> Router {
         .route("/groups/delete", post(groups_delete))
         .route("/groups/join", post(groups_join))
         .route("/groups/leave", post(groups_leave))
+        .route("/settings", get(crate::strategy::settings_page))
+        .route("/settings/save", post(crate::strategy::settings_save))
         .route("/oidc/login", get(oidc_login))
         .route("/oidc/callback", get(oidc_callback))
         .route("/panel.css", get(css))
@@ -877,7 +879,7 @@ async fn log_page(
 }
 
 /// The signed-in admin; everybody else gets the login or a refusal.
-async fn admin_of(panel: &Panel, headers: &HeaderMap) -> Result<String, Response> {
+pub(crate) async fn admin_of(panel: &Panel, headers: &HeaderMap) -> Result<String, Response> {
     let Some(user) = panel.user(headers).await else {
         return Err(redirect("/login", None));
     };
@@ -1646,7 +1648,7 @@ fn asset(content_type: &'static str, bytes: &'static [u8]) -> Response {
     res
 }
 
-fn html(status: StatusCode, page: askama::Result<String>) -> Response {
+pub(crate) fn html(status: StatusCode, page: askama::Result<String>) -> Response {
     match page {
         Ok(page) => (status, Html(page)).into_response(),
         Err(err) => {
@@ -1660,7 +1662,7 @@ fn redirect(to: &'static str, cookie: Option<String>) -> Response {
     redirect_to(to, cookie)
 }
 
-fn redirect_to(to: &str, cookie: Option<String>) -> Response {
+pub(crate) fn redirect_to(to: &str, cookie: Option<String>) -> Response {
     let Ok(location) = HeaderValue::from_str(to) else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "Ungültige Weiterleitung.").into_response();
     };

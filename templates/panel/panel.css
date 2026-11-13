@@ -180,3 +180,7 @@ table.log td.time { white-space: nowrap; }
   border-radius: 10px;
 }
 .update code { display: block; margin-top: 6px; overflow-x: auto; white-space: nowrap; }
+.ok { color: var(--on); margin: 0 0 12px; }
+.settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 0 20px; margin-bottom: 8px; }
+.settings select { width: 100%; }
+a.settings-link { display: block; margin-top: 4px; color: var(--accent); text-decoration: none; }

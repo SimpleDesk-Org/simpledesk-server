@@ -9,5 +9,6 @@ mod audit;
 mod mail;
 mod panel;
 mod peer;
+mod strategy;
 mod update;
 mod version;

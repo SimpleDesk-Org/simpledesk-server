@@ -1,0 +1,46 @@
+{% extends "panel/base.html" %}
+{% block title %}Einstellungen{% endblock %}
+{% block nav %}{% include "panel/nav.html" %}{% endblock %}
+{% block banner %}{% include "panel/update.html" %}{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>Zentrale Einstellungen</h1>
+  <p class="hint">Hier legst du fest, was auf den Geräten gilt. Die Gruppe eines Geräts geht vor „Alle Geräte“, und die Einstellung am Gerät selbst geht vor seiner Gruppe. Die Geräte übernehmen Änderungen nach ein paar Sekunden, sobald sie online sind.</p>
+  <div class="tabs">
+    <a href="{{ all_href }}"{% if all_current %} class="active"{% endif %}>Alle Geräte</a>
+    {% for link in groups %}<a href="{{ link.href }}"{% if link.current %} class="active"{% endif %}>Gruppe {{ link.name }}</a>{% endfor %}
+    {% for link in devices %}<a href="{{ link.href }}"{% if link.current %} class="active"{% endif %}>Gerät {{ link.name }}</a>{% endfor %}
+  </div>
+  {% if !all_devices.is_empty() %}
+  <form class="inline" method="get" action="/settings">
+    <label>Ein Gerät einzeln einstellen
+      <select name="device">{% for choice in all_devices %}<option value="{{ choice.value }}"{% if choice.selected %} selected{% endif %}>{{ choice.label }}</option>{% endfor %}</select>
+    </label>
+    <button type="submit">Öffnen</button>
+  </form>
+  {% endif %}
+</section>
+
+<section class="card add">
+  <h1>{{ title }}</h1>
+  <p class="hint">{{ intro }} Was auf „Standard“ oder „wie …“ steht, kommt von weiter oben.</p>
+  {% if saved %}<p class="ok">Gespeichert. Die Geräte übernehmen es nach ein paar Sekunden, sobald sie online sind.</p>{% endif %}
+  {% if !error.is_empty() %}<p class="error">{{ error }}</p>{% endif %}
+  <form method="post" action="/settings/save">
+    <input type="hidden" name="scope" value="{{ scope }}">
+    <input type="hidden" name="target" value="{{ target }}">
+    {% for section in sections %}
+    <h2>{{ section.title }}</h2>
+    {% if !section.hint.is_empty() %}<p class="hint">{{ section.hint }}</p>{% endif %}
+    <div class="settings">
+      {% for row in section.rows %}
+      <label>{{ row.label }}{% if row.needs_new_client %} <span class="badge quiet" title="Der jetzige SimpleDesk-Client hat diese Einstellung fest eingebaut.">braucht neuen Client</span>{% endif %}
+        <select name="{{ row.key }}">{% for choice in row.options %}<option value="{{ choice.value }}"{% if choice.selected %} selected{% endif %}>{{ choice.label }}</option>{% endfor %}</select>
+      </label>
+      {% endfor %}
+    </div>
+    {% endfor %}
+    <button type="submit">Speichern</button>
+  </form>
+</section>
+{% endblock %}

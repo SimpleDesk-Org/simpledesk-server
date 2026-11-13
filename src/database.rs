@@ -251,6 +251,20 @@ impl Database {
         self.add_column("panel_user", "last_login", "datetime").await?;
         self.add_column("panel_user", "blocked", "integer not null default 0").await?;
         self.create_id_tables().await?;
+        // "Zentrale Einstellungen": options for all devices (scope 'all', target ''), a group
+        // (scope 'group', target the group name) or a device (scope 'device', target its uuid
+        // in hex). Devices get them with the heartbeat.
+        sqlx::query(
+            "create table if not exists strategy_option (
+                scope varchar(10) not null,
+                target varchar(100) not null collate nocase,
+                key varchar(64) not null,
+                value text not null,
+                primary key (scope, target, key)
+            )",
+        )
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
         Ok(())
     }
 
@@ -813,6 +827,7 @@ impl Database {
             "delete from user_group_member where grp = ?",
             "update device_owner set grp = '' where grp = ?",
             "delete from ab_rule where kind = 'group' and name = ?",
+            "delete from strategy_option where scope = 'group' and target = ?",
             "delete from user_group where name = ?",
         ] {
             sqlx::query(statement)
@@ -1064,6 +1079,79 @@ impl Database {
         .execute(self.pool.get().await?.deref_mut())
         .await?;
         Ok(done.rows_affected() > 0)
+    }
+
+    /// The settings of a scope ('all', 'group' or 'device') and target, as (key, value).
+    pub async fn strategy_options(&self, scope: &str, target: &str) -> ResultType<Vec<(String, String)>> {
+        Ok(sqlx::query_as::<_, (String, String)>(
+            "select key, value from strategy_option where scope = ? and target = ? order by key",
+        )
+        .bind(scope)
+        .bind(target)
+        .fetch_all(self.pool.get().await?.deref_mut())
+        .await?)
+    }
+
+    /// Replaces the settings of a scope and target.
+    pub async fn set_strategy_options(&self, scope: &str, target: &str, options: &[(String, String)]) -> ResultType<()> {
+        let mut conn = self.pool.get().await?;
+        let mut tx = conn.begin().await?;
+        sqlx::query("delete from strategy_option where scope = ? and target = ?")
+            .bind(scope)
+            .bind(target)
+            .execute(&mut tx)
+            .await?;
+        for (key, value) in options {
+            sqlx::query("insert into strategy_option(scope, target, key, value) values(?, ?, ?, ?)")
+                .bind(scope)
+                .bind(target)
+                .bind(key)
+                .bind(value)
+                .execute(&mut tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The IDs of the devices that have settings of their own.
+    pub async fn devices_with_settings(&self) -> ResultType<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "select distinct p.id from peer p join strategy_option s
+                on s.scope = 'device' and s.target = lower(hex(p.uuid))
+             order by p.id collate nocase",
+        )
+        .fetch_all(self.pool.get().await?.deref_mut())
+        .await?)
+    }
+
+    /// For the registered device with this ID and uuid: its group ('' for none) and every
+    /// setting for all devices, its group and itself, as (scope, key, value). None if no such
+    /// device is registered.
+    pub async fn device_strategy(&self, id: &str, uuid: &[u8]) -> ResultType<Option<(String, Vec<(String, String, String)>)>> {
+        let mut conn = self.pool.get().await?;
+        let Some(group) = sqlx::query_scalar::<_, String>(
+            "select coalesce(o.grp, '') from peer p left join device_owner o on o.guid = p.guid
+             where p.id = ? and p.uuid = ?",
+        )
+        .bind(id)
+        .bind(uuid)
+        .fetch_optional(conn.deref_mut())
+        .await?
+        else {
+            return Ok(None);
+        };
+        let options = sqlx::query_as::<_, (String, String, String)>(
+            "select scope, key, value from strategy_option
+             where scope = 'all' or (scope = 'group' and target = ? and ? != '')
+                or (scope = 'device' and target = lower(hex(?)))",
+        )
+        .bind(&group)
+        .bind(&group)
+        .bind(uuid)
+        .fetch_all(conn.deref_mut())
+        .await?;
+        Ok(Some((group, options)))
     }
 
     /// The user signed in on a device becomes its owner, if the device with this ID was

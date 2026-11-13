@@ -542,36 +542,47 @@ struct HeartbeatRequest {
     /// SimpleDesk client: seconds since the last keyboard or mouse input on the device.
     #[serde(default)]
     simpledesk_idle_secs: Option<u64>,
+    /// The modified_at of the settings the device applied last.
+    #[serde(default)]
+    modified_at: i64,
 }
 
 /// Every few seconds from each device (without a token). The answer tells the device the ID
-/// an admin gave it: `assigned_id` differs from its ID, so it switches to it.
+/// an admin gave it: `assigned_id` differs from its ID, so it switches to it. When the
+/// "Zentrale Einstellungen" for the device changed, it also carries `strategy` and
+/// `modified_at`, as the open client expects them (see strategy.rs).
 async fn heartbeat(Extension(panel): Extension<Arc<Panel>>, body: Bytes) -> Response {
     let pm = &panel.pm;
     let req = serde_json::from_slice::<HeartbeatRequest>(&body).ok();
-    let assigned = match req
+    let (assigned, strategy) = match req
         .as_ref()
         .and_then(|req| base64::decode(req.uuid.trim()).ok().map(|uuid| (req, uuid)))
     {
         Some((req, uuid)) => {
             note_heartbeat(pm, req.id.trim(), &uuid, req.simpledesk_idle_secs).await;
-            match pm.db.id_assignment(&uuid).await {
+            let assigned = match pm.db.id_assignment(&uuid).await {
                 Ok(assigned) => assigned,
                 Err(err) => {
                     log::error!("SimpleDesk API: reading an ID for the heartbeat failed: {}", err);
                     None
                 }
-            }
+            };
+            let strategy = crate::strategy::for_heartbeat(pm, req.id.trim(), &uuid, req.modified_at).await;
+            (assigned, strategy)
         }
-        None => None,
+        None => (None, None),
     };
-    Json(json!({
+    let mut res = json!({
         "simpledesk": {
             "id_assigned": !pm.accounts.ids_by_admin || assigned.is_some(),
             "assigned_id": assigned.unwrap_or_default(),
         }
-    }))
-    .into_response()
+    });
+    if let Some((strategy, modified_at)) = strategy {
+        res["strategy"] = strategy;
+        res["modified_at"] = json!(modified_at);
+    }
+    Json(res).into_response()
 }
 
 /// The device tells about itself (hostname, username, os, ...); the panel shows it. Only
