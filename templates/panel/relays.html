@@ -1,0 +1,43 @@
+{% extends "panel/base.html" %}
+{% block title %}Relays{% endblock %}
+{% block nav %}{% include "panel/nav.html" %}{% endblock %}
+{% block banner %}{% include "panel/update.html" %}{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>Relays</h1>
+  {% if relays.is_empty() %}
+  <p class="hint">Es ist kein Relay eingetragen (<code>RELAY_SERVERS</code> ist leer). Die Geräte nehmen das Relay auf diesem Server, wie bisher.</p>
+  {% else if relays.len() == 1 %}
+  <p class="hint">Es gibt ein Relay. Mit nur einem Relay prüft und wählt der Server nichts, alles läuft wie bisher.</p>
+  {% else %}
+  <p class="hint">Der Server prüft die Relays alle 30 Sekunden über Port 443 und wählt für jede Verbindung eins:</p>
+  <ol class="rule">
+    <li>Ist eines der beiden Geräte in einem Netz aus <code>RELAY_NETWORKS</code>, nimmt er das Relay dieses Netzes. Das Gerät, auf das zugegriffen wird, zählt zuerst.</li>
+    <li>Sonst nimmt er das erreichbare Relay mit den wenigsten Verbindungen.</li>
+    <li>Ist keins erreichbar, nimmt er sie der Reihe nach.</li>
+  </ol>
+  <p class="hint">Hinweis: Der jetzige SimpleDesk-Client nimmt noch das Relay, das bei seiner Einrichtung eingetragen wurde. Die Auswahl hier wirkt erst mit einem Client, der das Relay vom Server nimmt.</p>
+  {% endif %}
+  {% for problem in problems %}<p class="error">RELAY_NETWORKS: {{ problem }}</p>{% endfor %}
+  {% if !relays.is_empty() %}
+  <div class="table-wrap">
+  <table>
+    <thead>
+      <tr><th>Relay</th><th>Zustand</th><th>Verbindungen</th><th>Netze</th><th>Geprüft</th></tr>
+    </thead>
+    <tbody>
+      {% for relay in relays %}
+      <tr>
+        <td class="id">{{ relay.name }}</td>
+        <td><span class="dot {% if relay.state == "up" %}on{% else if relay.state == "down" %}down{% else %}off{% endif %}"></span>{{ relay.state_text }}</td>
+        <td>{{ relay.connections }}</td>
+        <td>{{ relay.networks }}</td>
+        <td>{{ relay.checked }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+</section>
+{% endblock %}

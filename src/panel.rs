@@ -49,6 +49,8 @@ pub(crate) struct Panel {
     pub(crate) public_key: String,
     /// Whether GitHub has a newer version, for the banner admins see.
     pub(crate) update: Arc<crate::update::UpdateCheck>,
+    /// The relays of RELAY_SERVERS and what their last check found.
+    pub(crate) relays: Arc<crate::relays::RelayPool>,
 }
 
 impl Panel {
@@ -73,11 +75,17 @@ impl Panel {
             oidc,
             public_key: String::new(),
             update: Arc::new(crate::update::UpdateCheck::from_args()),
+            relays: Default::default(),
         })
     }
 
     pub(crate) fn with_public_key(mut self, key: String) -> Self {
         self.public_key = key;
+        self
+    }
+
+    pub(crate) fn with_relays(mut self, relays: Arc<crate::relays::RelayPool>) -> Self {
+        self.relays = relays;
         self
     }
 
@@ -614,13 +622,14 @@ pub(crate) async fn start(
     pm: PeerMap,
     tcp_peers: TcpPeers,
     public_key: String,
+    relays: Arc<crate::relays::RelayPool>,
 ) {
     if get_arg("PANEL").to_uppercase() == "N" {
         log::info!("SimpleDesk web panel is off (PANEL=N)");
         return;
     }
     let panel = match Panel::new(pm, tcp_peers).await {
-        Ok(panel) => Arc::new(panel.with_public_key(public_key)),
+        Ok(panel) => Arc::new(panel.with_public_key(public_key).with_relays(relays)),
         Err(err) => {
             log::error!("SimpleDesk web panel failed to start: {}", err);
             return;
@@ -668,6 +677,7 @@ pub(crate) fn router(panel: Arc<Panel>) -> Router {
         .route("/deploy", get(crate::deploy::deploy_page))
         .route("/deploy/new", post(crate::deploy::deploy_new))
         .route("/deploy/revoke", post(crate::deploy::deploy_revoke))
+        .route("/relays", get(crate::relays::relays_page))
         .route("/oidc/login", get(oidc_login))
         .route("/oidc/callback", get(oidc_callback))
         .route("/panel.css", get(css))

@@ -450,6 +450,10 @@ async fn make_pair(
     if ws {
         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
         let callback = |req: &Request, response: Response| {
+            // SimpleDesk: hbbs asks how many connections this relay carries.
+            if let Some(answer) = crate::relay_status::status_answer(req) {
+                return Err(answer);
+            }
             let headers = req.headers();
             // X-Real-IP / X-Forwarded-For are trusted as-is so that the real
             // client IP is preserved when the WebSocket port runs behind a
@@ -504,6 +508,7 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                         log::info!("Relayrequest {} from {} got paired", rf.uuid, addr);
                         let id = format!("{}:{}", addr.ip(), addr.port());
                         USAGE.write().await.insert(id.clone(), Default::default());
+                        let _session = crate::relay_status::Session::start();
                         if !stream.is_ws() && !peer.is_ws() {
                             peer.set_raw();
                             stream.set_raw();

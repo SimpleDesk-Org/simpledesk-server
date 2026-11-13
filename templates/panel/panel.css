@@ -41,7 +41,7 @@ body {
 }
 .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 17px; }
 .brand img { display: block; }
-nav { display: flex; align-items: center; gap: 16px; }
+nav { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 16px; }
 nav form { margin: 0; }
 .user { color: var(--muted); }
 nav a { color: var(--muted); text-decoration: none; }
@@ -187,3 +187,5 @@ a.settings-link { display: block; margin-top: 4px; color: var(--accent); text-de
 pre#command { margin: 0 0 10px; padding: 12px; overflow-x: auto; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; }
 .new-token { margin: 0 0 20px; }
 label input, label select { font-weight: 400; }
+.dot.down { background: var(--error); }
+ol.rule { margin: 0 0 16px; padding-left: 22px; color: var(--muted); }

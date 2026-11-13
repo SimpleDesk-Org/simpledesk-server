@@ -5,7 +5,6 @@ use hbb_common::{
     bytes::{Bytes, BytesMut},
     bytes_codec::BytesCodec,
     config,
-    futures::future::join_all,
     futures_util::{
         future::ready,
         sink::SinkExt,
@@ -45,7 +44,6 @@ use std::{
 enum Data {
     Msg(Box<RendezvousMessage>, SocketAddr),
     RelayServers0(String),
-    RelayServers(RelayServers),
 }
 
 pub(crate) const REG_TIMEOUT: i64 = 30_000;
@@ -78,7 +76,6 @@ type Sender = mpsc::UnboundedSender<Data>;
 type Receiver = mpsc::UnboundedReceiver<Data>;
 static ROTATION_RELAY_SERVER: AtomicUsize = AtomicUsize::new(0);
 type RelayServers = Vec<String>;
-const CHECK_RELAY_TIMEOUT: u64 = 3_000;
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
 const MAX_RELAY_UUID_LEN: usize = 128;
 
@@ -176,6 +173,8 @@ pub struct RendezvousServer {
     tx: Sender,
     relay_servers: Arc<RelayServers>,
     relay_servers0: Arc<RelayServers>,
+    /// SimpleDesk: with several relays, which are up and how busy (see relays.rs).
+    relays: Arc<crate::relays::RelayPool>,
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
 }
@@ -236,6 +235,7 @@ impl RendezvousServer {
             tx: tx.clone(),
             relay_servers: Default::default(),
             relay_servers0: Default::default(),
+            relays: Default::default(),
             rendezvous_servers: Arc::new(rendezvous_servers),
             inner: Arc::new(Inner {
                 serial,
@@ -262,6 +262,7 @@ impl RendezvousServer {
             rs.pm.clone(),
             rs.tcp_peers.clone(),
             key.clone(),
+            rs.relays.clone(),
         ));
         let mut listener = create_tcp_listener(internal_addr, port).await?;
         let mut listener2 = create_tcp_listener(internal_addr, nat_port).await?;
@@ -364,15 +365,15 @@ impl RendezvousServer {
         socket: &mut FramedSocket,
         key: &str,
     ) -> LoopFailure {
-        let mut timer_check_relay = interval(Duration::from_millis(CHECK_RELAY_TIMEOUT));
+        // SimpleDesk: the relays are checked over wss on port 443, see relays.rs.
+        let mut timer_check_relay = interval(Duration::from_secs(crate::relays::CHECK_SECS));
         loop {
             tokio::select! {
                 _ = timer_check_relay.tick() => {
                     if self.relay_servers0.len() > 1 {
-                        let rs = self.relay_servers0.clone();
-                        let tx = self.tx.clone();
+                        let relays = self.relays.clone();
                         tokio::spawn(async move {
-                            check_relay_servers(rs, tx).await;
+                            relays.check().await;
                         });
                     }
                 }
@@ -385,7 +386,6 @@ impl RendezvousServer {
                             }
                         }
                         Data::RelayServers0(rs) => { self.parse_relay_servers(&rs); }
-                        Data::RelayServers(rs) => { self.relay_servers = Arc::new(rs); }
                     }
                 }
                 res = socket.next() => {
@@ -1278,15 +1278,21 @@ impl RendezvousServer {
 
     fn parse_relay_servers(&mut self, relay_servers: &str) {
         let rs = get_servers(relay_servers, "relay-servers");
+        self.relays.configure(&rs, &get_arg("RELAY_NETWORKS"));
         self.relay_servers0 = Arc::new(rs);
         self.relay_servers = self.relay_servers0.clone();
     }
 
-    fn get_relay_server(&self, _pa: IpAddr, _pb: IpAddr) -> String {
+    /// The relay for a connection from `pa` to the device at `pb`. SimpleDesk: with several
+    /// relays the rule in relays.rs picks one; one after the other only if none is up.
+    fn get_relay_server(&self, pa: IpAddr, pb: IpAddr) -> String {
         if self.relay_servers.is_empty() {
             return "".to_owned();
         } else if self.relay_servers.len() == 1 {
             return self.relay_servers[0].clone();
+        }
+        if let Some(relay) = self.relays.pick(pb, pa) {
+            return relay;
         }
         let i = ROTATION_RELAY_SERVER.fetch_add(1, Ordering::SeqCst) % self.relay_servers.len();
         self.relay_servers[i].clone()
@@ -1761,33 +1767,6 @@ impl RendezvousServer {
     }
 }
 
-async fn check_relay_servers(rs0: Arc<RelayServers>, tx: Sender) {
-    let mut futs = Vec::new();
-    let rs = Arc::new(Mutex::new(Vec::new()));
-    for x in rs0.iter() {
-        let mut host = x.to_owned();
-        if !host.contains(':') {
-            host = format!("{}:{}", host, config::RELAY_PORT);
-        }
-        let rs = rs.clone();
-        let x = x.clone();
-        futs.push(tokio::spawn(async move {
-            if FramedStream::new(&host, None, CHECK_RELAY_TIMEOUT)
-                .await
-                .is_ok()
-            {
-                rs.lock().await.push(x);
-            }
-        }));
-    }
-    join_all(futs).await;
-    log::debug!("check_relay_servers");
-    let rs = std::mem::take(&mut *rs.lock().await);
-    if !rs.is_empty() {
-        tx.send(Data::RelayServers(rs)).ok();
-    }
-}
-
 // temp solution to solve udp socket failure
 async fn test_hbbs(addr: SocketAddr) -> ResultType<()> {
     let mut addr = addr;
@@ -1948,6 +1927,7 @@ mod tests {
             tx,
             relay_servers: Default::default(),
             relay_servers0: Default::default(),
+            relays: Default::default(),
             rendezvous_servers: Default::default(),
             inner: Arc::new(Inner {
                 serial: 0,

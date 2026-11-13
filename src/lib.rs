@@ -10,6 +10,8 @@ mod audit;
 mod mail;
 mod panel;
 mod peer;
+mod relay_status;
+mod relays;
 mod strategy;
 mod update;
 mod version;
