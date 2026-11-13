@@ -13,7 +13,7 @@ use crate::peer::PeerMap;
 use crate::rendezvous_server::TcpPeers;
 use askama::Template;
 use axum::{
-    extract::{Extension, Form, Query},
+    extract::{Extension, Form, Query, RawQuery},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -437,6 +437,11 @@ struct SetIdForm {
 }
 
 #[derive(Deserialize)]
+struct DeviceForm {
+    id: String,
+}
+
+#[derive(Deserialize)]
 struct AssignForm {
     id: String,
     #[serde(default)]
@@ -663,6 +668,7 @@ pub(crate) fn router(panel: Arc<Panel>) -> Router {
         .route("/ab/remove", post(ab_remove))
         .route("/devices/assign", post(devices_assign))
         .route("/devices/set-id", post(devices_set_id))
+        .route("/devices/delete", post(devices_delete))
         .route("/log", get(log_page))
         .route("/users", get(users_page))
         .route("/users/signout", post(users_signout))
@@ -755,6 +761,32 @@ async fn devices_set_id(
         Err(err) => {
             log::error!("SimpleDesk web panel: saving an ID failed: {}", err);
             render_devices(&panel, &admin, StatusCode::INTERNAL_SERVER_ERROR, "Speichern hat nicht geklappt.").await
+        }
+    }
+}
+
+/// Admins delete a device ("Löschen"): it leaves the list with its owner, ID, settings and
+/// sign-ins. A device that still runs SimpleDesk registers again, as a new device.
+async fn devices_delete(
+    Extension(panel): Extension<Arc<Panel>>,
+    headers: HeaderMap,
+    Form(form): Form<DeviceForm>,
+) -> Response {
+    let admin = match admin_of(&panel, &headers).await {
+        Ok(admin) => admin,
+        Err(res) => return res,
+    };
+    let id = form.id.trim();
+    match panel.pm.delete_device(id).await {
+        Ok(true) => {
+            log::info!("SimpleDesk web panel: {} deleted the device {}", admin, id);
+            crate::audit::log_change(&panel.pm, &admin, id, format!("Gerät gelöscht: {}", id)).await;
+            redirect("/", None)
+        }
+        Ok(false) => render_devices(&panel, &admin, StatusCode::BAD_REQUEST, "Dieses Gerät gibt es nicht.").await,
+        Err(err) => {
+            log::error!("SimpleDesk web panel: deleting a device failed: {}", err);
+            render_devices(&panel, &admin, StatusCode::INTERNAL_SERVER_ERROR, "Löschen hat nicht geklappt.").await
         }
     }
 }
@@ -1643,12 +1675,26 @@ async fn logout(Extension(panel): Extension<Arc<Panel>>, headers: HeaderMap) -> 
     )
 }
 
-async fn css() -> Response {
+/// A short fingerprint of the panel CSS. Pages load `/panel.css?v=<this>`, so browsers and
+/// caching proxies (Nginx Proxy Manager keeps CSS until 00:30) fetch it anew after an update.
+pub(crate) fn css_version() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        // FNV-1a: stable across builds and Rust versions.
+        let hash = PANEL_CSS
+            .bytes()
+            .fold(0xcbf29ce484222325u64, |hash, byte| (hash ^ byte as u64).wrapping_mul(0x100000001b3));
+        format!("{:08x}", hash as u32)
+    })
+}
+
+async fn css(RawQuery(query): RawQuery) -> Response {
     let mut res = PANEL_CSS.into_response();
-    res.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/css; charset=utf-8"),
-    );
+    let headers = res.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/css; charset=utf-8"));
+    // With the fingerprint the address changes with the content, so it may be kept long.
+    let cache = if query.is_some() { "public, max-age=31536000, immutable" } else { "no-cache" };
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
     res
 }
 
@@ -2201,6 +2247,48 @@ mod tests {
 
         // Without a session it leads to the login.
         assert_eq!(location(&send(&panel, get("/log", None)).await), "/login");
+    }
+
+    #[hbb_common::tokio::test]
+    async fn admins_delete_devices_and_the_css_has_a_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = test_panel(&dir).await;
+        let db = &panel.pm.db;
+        db.insert_peer("Alt-PC", b"uuid-alt", b"pk", "{}").await.unwrap();
+        db.save_device_info("Alt-PC", b"uuid-alt", r#"{"hostname":"ALT"}"#).await.unwrap();
+        let felix = signed_in(&panel, "felix").await;
+        let anna = signed_in(&panel, "anna").await;
+        send(&panel, post_form_with("/devices/assign", "id=Alt-PC&owner=anna&group=", &felix)).await;
+        db.insert_api_token(&token_hash("token-on-alt"), "anna", "Alt-PC").await.unwrap();
+        assert!(panel.pm.get("Alt-PC").await.is_some());
+
+        // Only admins delete, and they find the button next to each device.
+        let res = send(&panel, post_form_with("/devices/delete", "id=Alt-PC", &anna)).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let page = body(send(&panel, get("/", Some(&felix))).await).await;
+        assert!(page.contains("action=\"/devices/delete\""), "{page}");
+
+        // Deleting removes the device, its owner and the sign-ins on it; the log keeps it.
+        let res = send(&panel, post_form_with("/devices/delete", "id=Alt-PC", &felix)).await;
+        assert_eq!(location(&res), "/");
+        assert_eq!(db.device_guid("Alt-PC").await.unwrap(), None);
+        assert!(panel.pm.get("Alt-PC").await.is_none());
+        assert_eq!(db.device_owner("Alt-PC").await.unwrap(), None);
+        assert_eq!(crate::api::token_user(&panel.pm, "token-on-alt").await, None);
+        let page = body(send(&panel, get("/", Some(&felix))).await).await;
+        assert!(!page.contains("<td class=\"id\">Alt-PC</td>"), "{page}");
+        let log = body(send(&panel, get("/log", Some(&felix))).await).await;
+        assert!(log.contains("Gerät gelöscht: Alt-PC"), "{log}");
+        let res = send(&panel, post_form_with("/devices/delete", "id=Alt-PC", &felix)).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // The CSS address carries its fingerprint, so caches fetch it anew after updates.
+        let page = body(send(&panel, get("/login", None)).await).await;
+        assert!(page.contains(&format!("href=\"/panel.css?v={}\"", css_version())), "{page}");
+        let res = send(&panel, get(&format!("/panel.css?v={}", css_version()), None)).await;
+        assert!(res.headers()[header::CACHE_CONTROL].to_str().unwrap().contains("immutable"));
+        let res = send(&panel, get("/panel.css", None)).await;
+        assert_eq!(res.headers()[header::CACHE_CONTROL], "no-cache");
     }
 
     /// The day of `secs` as the date field of the browser sends it.

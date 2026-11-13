@@ -14,7 +14,7 @@
   <div class="table-wrap">
   <table>
     <thead>
-      <tr><th>Rechner</th><th>Benutzer</th><th>System</th><th>IP</th><th>Zuerst gesehen (UTC)</th><th>ID</th></tr>
+      <tr><th>Rechner</th><th>Benutzer</th><th>System</th><th>IP</th><th>Zuerst gesehen (UTC)</th><th>ID</th><th></th></tr>
     </thead>
     <tbody>
       {% for device in new_devices %}
@@ -29,6 +29,12 @@
             <input type="hidden" name="id" value="{{ device.id }}">
             <input class="short" name="new_id" value="{{ device.id }}" required maxlength="16" aria-label="Neue ID für {{ device.hostname }}">
             <button type="submit">ID vergeben</button>
+          </form>
+        </td>
+        <td class="actions">
+          <form method="post" action="/devices/delete" onsubmit="return confirm('Dieses Gerät aus der Liste löschen? Läuft SimpleDesk dort noch, meldet es sich wieder als neues Gerät.')">
+            <input type="hidden" name="id" value="{{ device.id }}">
+            <button class="link danger" type="submit">Löschen</button>
           </form>
         </td>
       </tr>
@@ -79,6 +85,10 @@
             </form>
             <p class="hint">Das Gerät übernimmt die neue ID nach ein paar Sekunden, sobald es online ist.</p>
           </details>
+          <form method="post" action="/devices/delete" onsubmit="return confirm('Gerät {{ device.id }} löschen? Besitzer, Gruppe, ID, Einstellungen und Anmeldungen auf dem Gerät werden entfernt. Läuft SimpleDesk dort noch, meldet es sich wieder als neues Gerät.')">
+            <input type="hidden" name="id" value="{{ device.id }}">
+            <button class="link danger" type="submit">Löschen</button>
+          </form>
         </td>
         {% else %}
         <td>{% if device.owner.is_empty() %}–{% else %}{{ device.owner }}{% endif %}</td>

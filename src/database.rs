@@ -1082,6 +1082,54 @@ impl Database {
         .await?)
     }
 
+    /// SimpleDesk: removes a device and what is stored about it: owner, assigned ID, system
+    /// info, last seen, its own settings and the client sign-ins on it. The log keeps its
+    /// entries. False if there is no such device.
+    pub async fn delete_device(&self, id: &str) -> ResultType<bool> {
+        let mut conn = self.pool.get().await?;
+        let Some((guid, uuid)) =
+            sqlx::query_as::<_, (Vec<u8>, Vec<u8>)>("select guid, uuid from peer where id = ?")
+                .bind(id)
+                .fetch_optional(conn.deref_mut())
+                .await?
+        else {
+            return Ok(false);
+        };
+        let uuid_hex: String = uuid.iter().map(|byte| format!("{:02x}", byte)).collect();
+        sqlx::query("begin").execute(conn.deref_mut()).await?;
+        let result: ResultType<()> = async {
+            for (sql, key) in [
+                ("delete from device_owner where guid = ?", &guid),
+                ("delete from device_seen where guid = ?", &guid),
+                ("delete from device_id where uuid = ?", &uuid),
+                ("delete from device_info where uuid = ?", &uuid),
+                ("delete from peer where guid = ?", &guid),
+            ] {
+                sqlx::query(sql).bind(key.as_slice()).execute(conn.deref_mut()).await?;
+            }
+            sqlx::query("delete from strategy_option where scope = 'device' and target = ?")
+                .bind(&uuid_hex)
+                .execute(conn.deref_mut())
+                .await?;
+            sqlx::query("delete from api_token where device_id = ?")
+                .bind(id)
+                .execute(conn.deref_mut())
+                .await?;
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                sqlx::query("commit").execute(conn.deref_mut()).await?;
+                Ok(true)
+            }
+            Err(err) => {
+                sqlx::query("rollback").execute(conn.deref_mut()).await.ok();
+                Err(err)
+            }
+        }
+    }
+
     /// Gives a device an owner and a group ('' for none); false if there is no such device.
     pub async fn assign_device(&self, id: &str, owner: &str, group: &str) -> ResultType<bool> {
         let done = sqlx::query(

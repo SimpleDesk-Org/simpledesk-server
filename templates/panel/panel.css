@@ -24,7 +24,10 @@
     --error: #ef6461;
   }
 }
+/* Native parts (scrollbars, select lists, date pickers, checkboxes) follow light and dark too. */
+:root { color-scheme: light dark; }
 * { box-sizing: border-box; }
+a { color: var(--accent); }
 body {
   margin: 0;
   font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -80,6 +83,14 @@ input {
   border-radius: 6px;
 }
 input:focus { outline: 2px solid var(--accent); border-color: transparent; }
+input[type=checkbox], input[type=radio] {
+  display: inline-block;
+  width: auto;
+  margin: 0 6px 0 0;
+  padding: 0;
+  vertical-align: middle;
+  accent-color: var(--accent);
+}
 button {
   padding: 9px 16px;
   font: inherit;
@@ -90,7 +101,9 @@ button {
   border-radius: 6px;
   cursor: pointer;
 }
+button:hover { filter: brightness(1.1); }
 button.link { padding: 0; color: var(--accent); background: none; font-weight: 400; }
+button.link:hover { filter: none; text-decoration: underline; }
 a.button {
   display: block;
   padding: 9px 16px;
@@ -166,7 +179,7 @@ form.inline.add { margin-top: 16px; }
   border-radius: 6px;
 }
 .tabs a.active { color: var(--text); font-weight: 600; border-color: var(--accent); }
-td.actions form + form { margin-top: 4px; }
+td.actions form + form, td.actions details + form { margin-top: 4px; }
 form.filter { margin: 0 0 16px; }
 form.filter input { width: 11em; }
 form.filter a.reset { align-self: center; color: var(--accent); }

@@ -220,6 +220,14 @@ impl PeerMap {
         tmp
     }
 
+    /// SimpleDesk: deletes a device from the database and from memory. A device that still
+    /// runs registers again later, as a new device. False if there is no such device.
+    pub(crate) async fn delete_device(&self, id: &str) -> ResultType<bool> {
+        let deleted = self.db.delete_device(id).await?;
+        self.map.write().await.remove(id);
+        Ok(deleted)
+    }
+
     #[inline]
     pub(crate) async fn get_in_memory(&self, id: &str) -> Option<LockPeer> {
         self.map.read().await.get(id).cloned()
