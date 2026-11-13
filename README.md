@@ -7,7 +7,7 @@ SimpleDesk ist ein Fork des kostenlosen RustDesk-Servers (`rustdesk/rustdesk-ser
 - Geräte können sich auch über TCP und WebSocket anmelden, nicht nur über UDP. Die Verbindung bleibt offen, der Server schickt alle 20 Sekunden ein Lebenszeichen, und Anfragen anderer Geräte kommen über diese Verbindung.
 - Neuer Schalter `WS_ONLY=Y` für hbbs und hbbr: Nur die WebSocket-Ports (21118 und 21119) lauschen auf der Bind-Adresse, alle anderen Ports nur auf 127.0.0.1. Verbindungen laufen dann immer über das Relay.
 - Ein Gerät kann seine ID ändern (`--set-id`), mit `IDS_BY_ADMIN=Y` aber nur auf die ID, die ein Admin vergeben hat.
-- Web-Panel in hbbs auf Port 21114: Anmelden über Eider, Geräteliste mit Status (Aktiv, AFK, Offline), Besitzer und Gruppe, eigenes und geteilte Adressbücher, die Seite „Protokoll“ und für Admins die Seite „Benutzer“. Abschalten mit `PANEL=N`.
+- Web-Panel in hbbs auf Port 21114: Anmelden über Eider, Geräteliste mit Status (Aktiv, AFK, Offline), Besitzer und Gruppe, eigenes und geteilte Adressbücher, die Seite „Protokoll“ und für Admins die Seiten „Benutzer“, „Einstellungen“, „Einrichten“ und „Relays“. Abschalten mit `PANEL=N`.
 - API für den Client auf demselben Port: Anmelden über Eider im Browser, eigenes und geteilte Adressbücher mit Einträgen und Tags, Status der Geräte (`POST /api/simpledesk/peer-status`). Heartbeat, Systeminfo und Protokoll-Einträge der Geräte werden gespeichert. `GET /api/simpledesk/server-info` nennt ohne Anmeldung den Key des Servers (wie in `id_ed25519.pub`), damit der Client sich beim ersten Start selbst einrichten kann.
 - Der Client fragt den Online-Status über WebSocket ab (`/ws/id`), hbbs antwortet dort. Vorher war mit WebSocket jedes Gerät „Offline“.
 - Neuer Schalter `LOGIN_REQUIRED=Y` (im Docker-Image Standard): Verbinden darf nur, wer im Client angemeldet ist und das Gerät steuern darf (siehe unten). Der Server prüft den Token, den der Client mit jeder Verbindungsanfrage schickt. Ohne Anmeldung sieht man „Bitte melde dich in SimpleDesk an“, ohne Recht „Du darfst dieses Gerät nicht steuern.“ Das gilt auch für den normalen RustDesk-Client. Geräte, auf die man zugreift, brauchen keine Anmeldung.
@@ -113,6 +113,60 @@ Die Einträge schickt das Gerät, auf das zugegriffen wird. Wer sich verbunden h
 - Eine kurze Mail kommt bei jedem Alarm eines Geräts, pro Gerät aber höchstens alle 10 Minuten. Im Protokoll steht jeder Alarm.
 - Mit `IDS_BY_ADMIN=Y` kommt eine Mail, wenn ein neues Gerät auf seine ID wartet.
 - Die Verbindung zum Mailserver ist immer verschlüsselt. Der Mailserver braucht ein Zertifikat, dem auch ein Browser vertraut.
+
+## Update-Hinweis im Panel
+
+| Variable | Bedeutung |
+|---|---|
+| `UPDATE_CHECK` | `N` schaltet den Hinweis ab. Standard: an. |
+
+- Das Docker-Image weiß, aus welchem Commit es gebaut ist (Build-Argument `SIMPLEDESK_COMMIT`, setzt der Workflow).
+- Für Admins fragt das Panel bei GitHub nach, nur bei `SimpleDesk-Org/simpledesk-server`: Gibt es Releases, zählt das neueste Release, sonst der Stand des Branches `simpledesk`. Ist dort etwas Neueres, steht oben „Neue Version verfügbar“ mit dem Befehl:
+
+  ```
+  cd /opt/rustdesk && sudo docker compose pull && sudo docker compose up -d
+  ```
+
+- Die Antwort von GitHub gilt 6 Stunden. Klappt die Abfrage nicht, zeigt das Panel einfach nichts. Ein selbst gebautes hbbs ohne Commit fragt gar nicht.
+
+## Zentrale Einstellungen
+
+Auf der Seite „Einstellungen“ legen Admins fest, was auf den Geräten gilt: für **alle Geräte**, für eine **Gruppe** oder für **ein Gerät**. Das Gerät geht vor seiner Gruppe, die Gruppe vor „Alle Geräte“. Was nicht festgelegt ist, bleibt beim Standard des Clients.
+
+- Zugriff (voll, nur ansehen, einzeln) und die einzelnen Rechte: Maus und Tastatur, Zwischenablage, Dateien, Ton, Terminal, Neustart, Aufnahme, Eingaben sperren
+- Verbindungen annehmen (mit Passwort oder per Klick, nur mit Passwort, nur per Klick) und welche Passwörter gelten (Einmal-Passwort, permanentes Passwort, beide)
+- Länge des Einmal-Passworts, Einmal-Passwort nur aus Ziffern
+- Eingehende Sitzungen auf dem Gerät aufnehmen, Verbinden nur bei offenem SimpleDesk-Fenster
+
+Die Geräte holen die Einstellungen mit dem Heartbeat (`strategy` und `modified_at` in der Antwort, wie es der offene Client erwartet), also nach ein paar Sekunden. Ohne Einstellungen sieht die Antwort aus wie bisher. „Verbindungen annehmen“ und „Welche Passwörter gelten“ hat der jetzige SimpleDesk-Client fest eingebaut. Sie wirken erst mit einem Client, der sie vom Server annimmt.
+
+## Geräte zentral einrichten
+
+Auf der Seite „Einrichten“ erstellen Admins einen Token, der 1 Stunde, 1 Tag, 7 oder 30 Tage gilt, und wählen Besitzer, Gruppe und ein geteiltes Adressbuch. Das Panel zeigt dazu einen Befehl für PowerShell. Auf dem Gerät: PowerShell als Administrator öffnen, Befehl einfügen, fertig. Der Befehl
+
+1. stellt das installierte SimpleDesk auf diesen Server ein (`--option`, wie die Einrichtung im Client) und
+2. ruft `--assign` auf. Ist das Gerät noch nicht beim Server angemeldet, versucht er es 2 Minuten lang alle 10 Sekunden.
+
+Den Token zeigt das Panel nur einmal, gespeichert wird nur sein Hash. Ein Token geht für beliebig viele Geräte, bis er abläuft oder ein Admin ihn löscht. Er kann nur das Gerät einrichten, auf dem der Befehl läuft (ID und uuid müssen passen). Mit `IDS_BY_ADMIN=Y` braucht das Gerät danach noch seine ID vom Admin.
+
+Die Schnittstelle dafür ist `POST /api/devices/cli` mit `Authorization: Bearer <Token>` und den Feldern von `--assign`: `user_name`, `device_group_name`, `address_book_name` (mit `address_book_tag`, `address_book_alias`, `address_book_note`, `address_book_password`). Benutzer, Gruppe und Adressbuch müssen schon existieren. `--strategy_name` braucht SimpleDesk nicht, die Einstellungen kommen über die Gruppe.
+
+## Mehrere Relays
+
+| Variable | Bedeutung |
+|---|---|
+| `RELAY_SERVERS` | Relays, mit Komma getrennt, zum Beispiel `relay1.example.org,relay2.example.org`. Jedes muss wie der Hauptserver über `wss://<relay>/ws/relay` auf Port 443 erreichbar sein. |
+| `RELAY_NETWORKS` | Netze mit festem Relay, zum Beispiel `10.1.0.0/16=relay1.example.org,192.0.2.0/24=relay2.example.org`. Jedes Relay muss auch in `RELAY_SERVERS` stehen. |
+
+Mit mehr als einem Relay prüft hbbs alle 30 Sekunden jedes Relay und wählt für jede Verbindung eins:
+
+1. Ist eines der beiden Geräte in einem Netz aus `RELAY_NETWORKS`, das Relay dieses Netzes (das Gerät, auf das zugegriffen wird, zählt zuerst). Es zählt die IP, die der Server sieht.
+2. Sonst das erreichbare Relay mit den wenigsten Verbindungen.
+3. Ist keins erreichbar, der Reihe nach.
+
+Zum Prüfen fragt hbbs `wss://<relay>/ws/relay/status`, hbbr antwortet mit seiner Zahl an Verbindungen. Auf jedem Relay muss deshalb das SimpleDesk-Image laufen, und der Proxy dort leitet `/ws/relay` an Port 21119. Kein GeoIP. Die Seite „Relays“ im Panel zeigt Zustand, Verbindungen und Netze. Mit einem Relay oder keinem prüft und wählt hbbs nichts, alles bleibt wie bisher.
+
+Wichtig: Das Gerät, auf das zugegriffen wird, nimmt beim jetzigen Client das Relay aus seiner eigenen Einrichtung. Die Auswahl des Servers wirkt erst mit einem Client, der das Relay vom Server nimmt.
 
 ## Betrieb nur über Port 443
 

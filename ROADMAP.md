@@ -38,6 +38,11 @@ Gearbeitet wird jeweils auf dem Branch `simpledesk`.
 - Status Aktiv, AFK (`AFK_MINUTES`) und Offline mit „seit“, im Panel und über `/api/simpledesk/peer-status`
 - Seite „Protokoll“: Verbindungen, Dateien, Alarme und Änderungen im Panel (`AUDIT_DAYS`)
 - Alarm-Mails über SMTP, auch wenn ein neues Gerät auf seine ID wartet
+- Update-Hinweis für Admins im Panel (`UPDATE_CHECK`), das Image kennt seinen Commit
+- Panel mit SimpleDesk-Icon (Favicon und Kopfzeile)
+- Seite „Einstellungen“: zentrale Einstellungen für alle Geräte, Gruppen und einzelne Geräte, über den Heartbeat
+- Seite „Einrichten“: Token mit Ablaufzeit und PowerShell-Befehl, Server-Seite von `--assign` (`/api/devices/cli`)
+- Mehrere Relays (`RELAY_SERVERS`, `RELAY_NETWORKS`) mit Prüfung über Port 443 und Seite „Relays“
 
 ## Als Nächstes
 
@@ -48,6 +53,8 @@ Gearbeitet wird jeweils auf dem Branch `simpledesk`.
 5. Client: nur noch erlaubte Server (Allowlist für klg-orga.de und felixthedev.com)
 6. Client: Liste „Zugängliche Geräte“ (`/api/peers`) mit den eigenen Geräten und denen der Gruppen
 7. Client: `simpledesk_idle_secs` im Heartbeat schicken und Aktiv, AFK und Offline an den Geräten zeigen
+8. Client: `approve-mode` und `verification-method` aus den zentralen Einstellungen annehmen (heute fest eingebaut, `FIXED_OPTIONS` in simpledesk-common)
+9. Client: das Relay vom Server nehmen statt aus der eigenen Einrichtung, damit mehrere Relays wirken (`get_relay_server` in `src/rendezvous_mediator.rs`)
 
 ## Pro-Funktionen
 
@@ -63,9 +70,9 @@ Gearbeitet wird jeweils auf dem Branch `simpledesk`.
 | Adressbuch | persönliche und geteilte Adressbücher fertig (Client und Panel) |
 | Audit-Log (Verbindungen, Dateien, Alarme) | fertig: Seite „Protokoll“, auch Änderungen im Panel |
 | Zugriffsrechte, Rollen Admin und Control | Admin und Benutzer, Gruppen, Gerätebesitzer und Sperren fertig |
-| Zentrale Einstellungen für alle Clients | offen |
-| Geräte zentral einrichten | offen |
-| Mehrere Relays, das nächste automatisch | offen |
+| Zentrale Einstellungen für alle Clients | fertig im Server (Seite „Einstellungen“), Annehmen und Passwortart brauchen ein Client-Update |
+| Geräte zentral einrichten | fertig (Seite „Einrichten“, `--assign` mit Token) |
+| Mehrere Relays, das nächste automatisch | fertig im Server (Netze, sonst wenigste Verbindungen), wirkt erst mit einem Client-Update |
 | OIDC (Eider) | fertig und live, einziger Weg zum Anmelden |
 | LDAP (AD) | offen |
 | SMTP für Mails | Alarm-Mails und „neues Gerät wartet“ fertig |
