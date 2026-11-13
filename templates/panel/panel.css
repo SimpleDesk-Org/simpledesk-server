@@ -171,3 +171,11 @@ table.log td { vertical-align: top; }
 table.log td.time { white-space: nowrap; }
 .kind { font-size: 13px; color: var(--muted); }
 .kind.alarm { color: var(--error); font-weight: 600; }
+.update {
+  margin: 0 0 20px;
+  padding: 12px 16px;
+  background: var(--card);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+}
+.update code { display: block; margin-top: 6px; overflow-x: auto; white-space: nowrap; }

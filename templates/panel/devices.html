@@ -1,6 +1,7 @@
 {% extends "panel/base.html" %}
 {% block title %}Geräte{% endblock %}
 {% block nav %}{% include "panel/nav.html" %}{% endblock %}
+{% block banner %}{% include "panel/update.html" %}{% endblock %}
 {% block content %}
 {% if admin && ids_by_admin %}
 <section class="card new-devices">

@@ -38,6 +38,8 @@ jobs:
           context: .
           file: simpledesk/Dockerfile
           push: true
+          build-args: |
+            SIMPLEDESK_COMMIT=${{ github.sha }}
           tags: |
             ghcr.io/simpledesk-org/simpledesk-server:latest
             ghcr.io/simpledesk-org/simpledesk-server:${{ github.sha }}

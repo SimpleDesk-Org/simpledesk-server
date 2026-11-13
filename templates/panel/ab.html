@@ -1,6 +1,7 @@
 {% extends "panel/base.html" %}
 {% block title %}Adressbuch{% endblock %}
 {% block nav %}{% include "panel/nav.html" %}{% endblock %}
+{% block banner %}{% include "panel/update.html" %}{% endblock %}
 {% block content %}
 <nav class="tabs" aria-label="Adressbücher">
   {% for link in books %}

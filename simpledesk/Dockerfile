@@ -3,7 +3,9 @@
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY . .
-RUN cargo build --release --bin hbbs --bin hbbr
+# The commit the image is built from; the panel compares it with GitHub (UPDATE_CHECK).
+ARG SIMPLEDESK_COMMIT=""
+RUN SIMPLEDESK_COMMIT="$SIMPLEDESK_COMMIT" cargo build --release --bin hbbs --bin hbbr
 
 FROM debian:bookworm-slim
 RUN apt-get update \

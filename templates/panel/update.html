@@ -1,0 +1,6 @@
+{% if !update.is_empty() %}
+<div class="update" role="status">
+  <strong>Neue Version verfügbar</strong> ({{ update }}). So holst du sie auf den Server:
+  <code>cd /opt/rustdesk &amp;&amp; sudo docker compose pull &amp;&amp; sudo docker compose up -d</code>
+</div>
+{% endif %}

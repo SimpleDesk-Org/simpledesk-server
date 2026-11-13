@@ -42,6 +42,8 @@ pub(crate) struct Panel {
     pub(crate) oidc: Option<Oidc>,
     /// The key clients need, the same text as id_ed25519.pub.
     pub(crate) public_key: String,
+    /// Whether GitHub has a newer version, for the banner admins see.
+    pub(crate) update: Arc<crate::update::UpdateCheck>,
 }
 
 impl Panel {
@@ -65,6 +67,7 @@ impl Panel {
             tcp_peers,
             oidc,
             public_key: String::new(),
+            update: Arc::new(crate::update::UpdateCheck::from_args()),
         })
     }
 
@@ -77,6 +80,15 @@ impl Panel {
     pub(crate) fn with_oidc(mut self, oidc: Oidc) -> Self {
         self.oidc = Some(oidc);
         self
+    }
+
+    /// For admins: what the banner "Neue Version verfügbar" says, '' for no banner.
+    async fn update_notice(&self, user: &str) -> String {
+        if self.pm.accounts.is_admin(user) {
+            self.update.notice().await
+        } else {
+            String::new()
+        }
     }
 
     pub(crate) fn oidc_name(&self) -> &str {
@@ -345,6 +357,7 @@ struct DevicesPage<'a> {
     user: &'a str,
     admin: bool,
     active: &'a str,
+    update: &'a str,
     devices: &'a [Device],
     /// For admins with IDS_BY_ADMIN: devices that wait for an ID.
     new_devices: &'a [NewDevice],
@@ -389,6 +402,7 @@ struct LogPage<'a> {
     user: &'a str,
     admin: bool,
     active: &'a str,
+    update: &'a str,
     entries: &'a [LogEntry],
     device: &'a str,
     user_filter: &'a str,
@@ -443,6 +457,7 @@ struct UsersPage<'a> {
     user: &'a str,
     admin: bool,
     active: &'a str,
+    update: &'a str,
     oidc_name: &'a str,
     users: &'a [UserView],
     groups: &'a [GroupView],
@@ -490,6 +505,7 @@ struct AbPage<'a> {
     user: &'a str,
     admin: bool,
     active: &'a str,
+    update: &'a str,
     books: &'a [BookLink],
     book: &'a AbRow,
     /// What the user may do here: "lesen", "schreiben" or "voll".
@@ -666,12 +682,14 @@ async fn render_devices(panel: &Panel, user: &str, status: StatusCode, error: &s
         }
     };
     let online = devices.iter().filter(|device| device.online).count();
+    let update = panel.update_notice(user).await;
     html(
         status,
         DevicesPage {
             user,
             admin: panel.pm.accounts.is_admin(user),
             active: "devices",
+            update: &update,
             devices: &devices,
             new_devices: &new_devices,
             ids_by_admin: panel.pm.accounts.ids_by_admin,
@@ -823,12 +841,14 @@ async fn log_page(
     };
     let entries: Vec<LogEntry> = rows.iter().take(LOG_LIMIT).map(log_entry).collect();
     let status = if error.is_empty() { StatusCode::OK } else { StatusCode::BAD_REQUEST };
+    let update = panel.update_notice(&user).await;
     html(
         status,
         LogPage {
             user: &user,
             admin,
             active: "log",
+            update: &update,
             entries: &entries,
             device: query.device.trim(),
             user_filter: query.user.trim(),
@@ -944,6 +964,7 @@ async fn render_users(panel: &Panel, me: &str, status: StatusCode, error: &str) 
         Ok((users, groups))
     }
     .await;
+    let update = panel.update_notice(me).await;
     match result {
         Ok((users, groups)) => html(
             status,
@@ -951,6 +972,7 @@ async fn render_users(panel: &Panel, me: &str, status: StatusCode, error: &str) 
                 user: me,
                 admin: true,
                 active: "users",
+                update: &update,
                 oidc_name: panel.oidc_name(),
                 users: &users,
                 groups: &groups,
@@ -1183,10 +1205,12 @@ async fn render_ab(panel: &Panel, user: &str, book: &str, status: StatusCode, er
         } else {
             Default::default()
         };
+        let update = panel.update_notice(user).await;
         let page = AbPage {
             user,
             admin: panel.pm.accounts.is_admin(user),
             active: "ab",
+            update: &update,
             books: &books,
             book: &current,
             right: right_label(rule),
@@ -2156,6 +2180,31 @@ mod tests {
         panel.pm.db.age_logins("felix", 2).await.unwrap();
         let res = send(&panel, get("/", Some(&cookie))).await;
         assert_eq!(location(&res), "/login");
+    }
+
+    #[hbb_common::tokio::test]
+    async fn admins_see_when_a_new_version_is_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = crate::peer::test_peer_map(&dir).await;
+        pm.accounts = Arc::new(crate::accounts::Accounts::with_admins("felix"));
+        let mut panel = Panel::new(pm, Default::default()).await.unwrap();
+        panel.update = Arc::new(crate::update::UpdateCheck::with_notice("2 neue Änderungen"));
+        let panel = Arc::new(panel);
+        let felix = signed_in(&panel, "felix").await;
+        let anna = signed_in(&panel, "anna").await;
+        let command = "cd /opt/rustdesk &amp;&amp; sudo docker compose pull &amp;&amp; sudo docker compose up -d";
+        for path in ["/", "/ab", "/log", "/users"] {
+            let page = body(send(&panel, get(path, Some(&felix))).await).await;
+            assert!(page.contains("Neue Version verfügbar</strong> (2 neue Änderungen)"), "{path}: {page}");
+            assert!(page.contains(command), "{path}: {page}");
+        }
+        for path in ["/", "/ab", "/log"] {
+            let page = body(send(&panel, get(path, Some(&anna))).await).await;
+            assert!(!page.contains("Neue Version"), "{path}: {page}");
+        }
+        // A build without its commit checks nothing, so there is no banner.
+        let page = body(send(&test_panel(&dir).await, get("/", Some(&felix))).await).await;
+        assert!(!page.contains("Neue Version"), "{page}");
     }
 
     #[test]
