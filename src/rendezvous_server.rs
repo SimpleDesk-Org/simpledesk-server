@@ -647,6 +647,13 @@ impl RendezvousServer {
                     // SimpleDesk: accepted over TCP/WebSocket too, the connection stays open.
                     return self.handle_tcp_register_pk(rk, sink, addr, conn).await;
                 }
+                Some(rendezvous_message::Union::OnlineRequest(or)) => {
+                    // SimpleDesk: with WebSocket the client asks over `/ws/id` and not on
+                    // the NAT port. Without an answer it shows every device as offline.
+                    let msg_out = self.online_response(&or.peers).await;
+                    Self::send_to_sink(sink, msg_out).await;
+                    return true;
+                }
                 _ => {}
             }
         }
@@ -1116,6 +1123,16 @@ impl RendezvousServer {
         stream: &mut FramedStream,
         peers: Vec<String>,
     ) -> ResultType<()> {
+        let msg_out = self.online_response(&peers).await;
+        stream.send(&msg_out).await?;
+
+        Ok(())
+    }
+
+    /// The answer to an OnlineRequest: one bit per ID, set if the device is online.
+    /// SimpleDesk: shared by the NAT port and TCP/WebSocket, where the client asks over
+    /// `/ws/id` when it uses WebSocket.
+    async fn online_response(&self, peers: &[String]) -> RendezvousMessage {
         let mut states = BytesMut::zeroed((peers.len() + 7) / 8);
         for (i, peer_id) in peers.iter().enumerate() {
             if let Some(peer) = self.pm.get_in_memory(peer_id).await {
@@ -1134,9 +1151,7 @@ impl RendezvousServer {
             states: states.into(),
             ..Default::default()
         });
-        stream.send(&msg_out).await?;
-
-        Ok(())
+        msg_out
     }
 
     #[inline]
@@ -2272,6 +2287,73 @@ mod tests {
 
         drop(device);
         assert_forgotten(&rs, device_addr).await;
+    }
+
+    async fn ws_connect(rs: &RendezvousServer) -> tokio_tungstenite::WebSocketStream<TcpStream> {
+        let server_addr = serve_one(rs, true).await;
+        let stream = TcpStream::connect(server_addr).await.unwrap();
+        let (ws, _) = tokio_tungstenite::client_async(format!("ws://{server_addr}/ws/id"), stream)
+            .await
+            .unwrap();
+        ws
+    }
+
+    /// The online bits of `ids`, asked like the client does with WebSocket: over `/ws/id`.
+    async fn ws_online_states(rs: &RendezvousServer, ids: &[&str]) -> Vec<bool> {
+        let mut client = ws_connect(rs).await;
+        let mut msg = RendezvousMessage::new();
+        msg.set_online_request(OnlineRequest {
+            id: "Felix-Laptop".to_owned(),
+            peers: ids.iter().map(|id| id.to_string()).collect(),
+            ..Default::default()
+        });
+        client
+            .send(tungstenite::Message::Binary(Bytes::from(msg.write_to_bytes().unwrap())))
+            .await
+            .unwrap();
+        let states = next_ws_msg(&mut client).await.online_response().states.clone();
+        (0..ids.len())
+            .map(|i| states[i / 8] & (0x01 << (7 - i % 8)) != 0)
+            .collect()
+    }
+
+    #[hbb_common::tokio::test]
+    async fn online_query_over_websocket_sees_websocket_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        let rs = test_server(&dir).await;
+        let mut device = ws_connect(&rs).await;
+        device
+            .send(tungstenite::Message::Binary(register_pk_msg("Rathaus-PC")))
+            .await
+            .unwrap();
+        assert_registered(&next_ws_msg(&mut device).await);
+        online_device(&rs, "Lager-PC", b"uuid-lager", "198.51.100.3:5000").await;
+        rs.pm.get_in_memory("Lager-PC").await.unwrap().write().await.last_reg_time =
+            get_expired_time();
+
+        // Before the fix the WebSocket connection closed without an answer, so the client
+        // showed every device as offline, also the one it was connected to.
+        let ids = ["Rathaus-PC", "Lager-PC", "Gibt-Es-Nicht"];
+        assert_eq!(ws_online_states(&rs, &ids).await, [true, false, false]);
+        // Nine IDs need a second byte.
+        let many = ["a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "Rathaus-PC"];
+        let states = ws_online_states(&rs, &many).await;
+        assert_eq!(states, [false, false, false, false, false, false, false, false, true]);
+
+        // The echoed heartbeat keeps it online; without its connection it is offline.
+        device
+            .send(tungstenite::Message::Binary(Bytes::new()))
+            .await
+            .unwrap();
+        assert_eq!(ws_online_states(&rs, &["Rathaus-PC"]).await, [true]);
+        drop(device);
+        for _ in 0..100 {
+            if ws_online_states(&rs, &["Rathaus-PC"]).await == [false] {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("Rathaus-PC stayed online without its connection");
     }
 
     #[hbb_common::tokio::test]
