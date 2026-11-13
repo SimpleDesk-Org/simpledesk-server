@@ -1506,7 +1506,7 @@ mod tests {
         assert!(!page.contains("<input") && !page.contains("Passwort"), "{page}");
         assert!(page.contains("nicht eingerichtet"), "{page}");
         // Every page links to its source code (AGPL).
-        assert!(page.contains("href=\"https://github.com/felixthedevgit/simpledesk-server\">Quellcode</a>"), "{page}");
+        assert!(page.contains("href=\"https://github.com/SimpleDesk-Org/simpledesk-server\">Quellcode</a>"), "{page}");
         assert!(page.contains("Open Source (AGPL)"), "{page}");
         let res = send(&panel, post_form("/login", "name=felix&password=lang-genug-123")).await;
         assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);

@@ -6,9 +6,9 @@ SimpleDesk ist ein Fork von RustDesk (Server, Client und gemeinsamer Code). Ziel
 
 | Repo | Fork von | Inhalt |
 |---|---|---|
-| [simpledesk-server](https://github.com/felixthedevgit/simpledesk-server) | rustdesk/rustdesk-server | ID-Server (hbbs) und Relay (hbbr), später API und Web-Panel |
-| [simpledesk](https://github.com/felixthedevgit/simpledesk) | rustdesk/rustdesk | Client |
-| [simpledesk-common](https://github.com/felixthedevgit/simpledesk-common) | rustdesk/hbb_common | gemeinsamer Code von Client und Server |
+| [simpledesk-server](https://github.com/SimpleDesk-Org/simpledesk-server) | rustdesk/rustdesk-server | ID-Server (hbbs) und Relay (hbbr), später API und Web-Panel |
+| [simpledesk](https://github.com/SimpleDesk-Org/simpledesk) | rustdesk/rustdesk | Client |
+| [simpledesk-common](https://github.com/SimpleDesk-Org/simpledesk-common) | rustdesk/hbb_common | gemeinsamer Code von Client und Server |
 
 Gearbeitet wird jeweils auf dem Branch `simpledesk`.
 
@@ -17,7 +17,7 @@ Gearbeitet wird jeweils auf dem Branch `simpledesk`.
 - Anmeldung der Geräte über WebSocket (Port 443), nicht nur über UDP
 - Schalter `WS_ONLY=Y`: nach außen nur die WebSocket-Ports, alles läuft über das Relay
 - ID ändern (`--set-id`)
-- Docker-Image `ghcr.io/felixthedevgit/simpledesk-server`
+- Docker-Image `ghcr.io/simpledesk-org/simpledesk-server`
 - Server fragt nicht mehr täglich bei RustDesk nach Updates
 - Client: eingebauter Server, Key und API statt RustDesk-Servern
 - Client: Update-Check und Updates nur aus den eigenen Releases, mit eigenem Signaturschlüssel
