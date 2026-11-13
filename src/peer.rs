@@ -42,6 +42,13 @@ pub(crate) struct Peer {
     pub(crate) info: PeerInfo,
     // pub(crate) disabled: bool,
     pub(crate) reg_pk: (u32, Instant), // how often register_pk
+    // SimpleDesk: unix seconds of the last user input the device told in its heartbeat.
+    pub(crate) last_input: Option<u64>,
+    // SimpleDesk: unix seconds the device was last seen (heartbeat or end of its connection),
+    // 0 if not since hbbs started; the database keeps it too.
+    pub(crate) last_seen: u64,
+    // SimpleDesk: when last_seen was last written to the database.
+    pub(crate) last_seen_saved: u64,
 }
 
 impl Default for Peer {
@@ -56,7 +63,17 @@ impl Default for Peer {
             // user: None,
             // disabled: false,
             reg_pk: (0, get_expired_time()),
+            last_input: None,
+            last_seen: 0,
+            last_seen_saved: 0,
         }
+    }
+}
+
+impl Peer {
+    /// Whether the device is online: it registered within REG_TIMEOUT.
+    pub(crate) fn is_online(&self) -> bool {
+        (self.last_reg_time.elapsed().as_millis() as i64) < crate::rendezvous_server::REG_TIMEOUT
     }
 }
 

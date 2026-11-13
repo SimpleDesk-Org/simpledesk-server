@@ -7,10 +7,10 @@
 
 use crate::common::get_arg;
 use crate::oidc::{Oidc, OidcConfig, Purpose};
-use crate::api::{RULE_FULL, RULE_READ, RULE_WRITE};
+use crate::api::{DeviceState, RULE_FULL, RULE_READ, RULE_WRITE};
 use crate::database::{AbRow, DeviceRow};
 use crate::peer::PeerMap;
-use crate::rendezvous_server::{TcpPeers, REG_TIMEOUT};
+use crate::rendezvous_server::TcpPeers;
 use askama::Template;
 use axum::{
     extract::{Extension, Form, Query},
@@ -215,6 +215,7 @@ impl Panel {
                 owner,
                 group,
                 assigned_id,
+                last_seen,
                 ..
             } = row;
             let pending_id = assigned_id.filter(|assigned| *assigned != id).unwrap_or_default();
@@ -226,19 +227,23 @@ impl Panel {
             } else {
                 Default::default()
             };
-            let (online, websocket) = match self.pm.get_in_memory(&id).await {
+            let websocket = match self.pm.get_in_memory(&id).await {
                 Some(peer) => {
                     let peer = peer.read().await;
-                    let online = (peer.last_reg_time.elapsed().as_millis() as i64) < REG_TIMEOUT;
-                    let websocket =
-                        online && self.tcp_peers.lock().await.contains_key(&peer.socket_addr);
-                    (online, websocket)
+                    peer.is_online() && self.tcp_peers.lock().await.contains_key(&peer.socket_addr)
                 }
-                None => (false, false),
+                None => false,
+            };
+            let (state, since) = crate::api::current_state(&self.pm, &id, last_seen).await;
+            let since = match state {
+                DeviceState::Active => String::new(),
+                _ => crate::api::since_text(since, crate::api::unix_now()),
             };
             devices.push(Device {
                 id,
-                online,
+                online: state != DeviceState::Offline,
+                state: state.as_str(),
+                since,
                 websocket,
                 ip,
                 registered,
@@ -266,7 +271,12 @@ pub(crate) struct NewDevice {
 
 pub(crate) struct Device {
     pub(crate) id: String,
+    /// Online, active or AFK.
     pub(crate) online: bool,
+    /// "active", "afk" or "offline".
+    pub(crate) state: &'static str,
+    /// For AFK and offline: "seit 12 min", '' if unknown.
+    pub(crate) since: String,
     pub(crate) websocket: bool,
     pub(crate) ip: String,
     pub(crate) registered: String,
@@ -1525,7 +1535,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let page = body(res).await;
         assert!(page.contains("Felix-Work-PC") && page.contains("203.0.113.7"), "{page}");
-        assert!(page.contains("offline"));
+        assert!(page.contains("Offline"));
 
         // Logout ends the session.
         let mut req = post_form("/logout", "");
@@ -1808,6 +1818,44 @@ mod tests {
         let page = body(send(&panel, get("/", Some(&felix))).await).await;
         assert!(page.contains("<td class=\"id\">123456789<span class=\"pending\">wird zu Rathaus-PC</span>"), "{page}");
         assert!(page.contains("ID ändern") && page.contains("Gerade wartet kein Gerät auf eine ID"), "{page}");
+    }
+
+    #[hbb_common::tokio::test]
+    async fn device_list_shows_active_afk_and_offline() {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = test_panel(&dir).await;
+        let db = &panel.pm.db;
+        for id in ["Aktiv-PC", "Pause-PC", "Aus-PC", "Nie-PC"] {
+            db.insert_peer(id, id.as_bytes(), b"pk", "{}").await.unwrap();
+        }
+        let now = crate::api::unix_now();
+        for (id, online, input) in [
+            ("Aktiv-PC", true, Some(now - 30)),
+            ("Pause-PC", true, Some(now - 12 * 60 - 5)),
+            ("Aus-PC", false, None),
+        ] {
+            let peer = panel.pm.get(id).await.unwrap();
+            let mut peer = peer.write().await;
+            if online {
+                peer.last_reg_time = std::time::Instant::now();
+            }
+            peer.last_input = input;
+        }
+        // When Aus-PC was last seen comes from the database, as after a restart of hbbs.
+        let guid = panel.pm.get("Aus-PC").await.unwrap().read().await.guid.clone();
+        db.save_last_seen(&guid, now - 3 * 3600).await.unwrap();
+
+        let felix = signed_in(&panel, "felix").await;
+        let page = body(send(&panel, get("/", Some(&felix))).await).await;
+        let row = |id: &str| {
+            let start = page.find(&format!("<td class=\"id\">{id}</td>")).unwrap();
+            page[start..start + page[start..].find("</tr>").unwrap()].to_owned()
+        };
+        assert!(row("Aktiv-PC").contains("<span class=\"dot on\"></span>Online (Aktiv)"), "{page}");
+        assert!(row("Pause-PC").contains("<span class=\"dot afk\"></span>AFK (seit 12 min)"), "{page}");
+        assert!(row("Aus-PC").contains("<span class=\"dot off\"></span>Offline (seit 3 h)"), "{page}");
+        assert!(row("Nie-PC").contains("<span class=\"dot off\"></span>Offline</td>"), "{page}");
+        assert!(page.contains("4 Geräte, davon 2 online"), "{page}");
     }
 
     #[hbb_common::tokio::test]

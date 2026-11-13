@@ -1629,9 +1629,25 @@ impl RendezvousServer {
             // Without its connection the device cannot be reached, so it is offline now and
             // not only after REG_TIMEOUT. Unless it registered again on another connection.
             if let Some(peer) = self.pm.get_in_memory(&id).await {
-                let mut peer = peer.write().await;
-                if peer.socket_addr == addr {
-                    peer.last_reg_time = get_expired_time();
+                let now = crate::api::unix_now();
+                let guid = {
+                    let mut peer = peer.write().await;
+                    if peer.socket_addr == addr {
+                        peer.last_reg_time = get_expired_time();
+                        // SimpleDesk: "Offline seit" starts now; the input time is old by
+                        // the next time it comes online.
+                        peer.last_seen = now;
+                        peer.last_seen_saved = now;
+                        peer.last_input = None;
+                        Some(peer.guid.clone()).filter(|guid| !guid.is_empty())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(guid) = guid {
+                    if let Err(err) = self.pm.db.save_last_seen(&guid, now).await {
+                        log::error!("Saving when {} was last seen failed: {}", id, err);
+                    }
                 }
             }
         }
@@ -2249,6 +2265,19 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(!online(&*peer.read().await));
+        // SimpleDesk: "Offline seit" starts when the connection ends, also after a restart.
+        let now = crate::api::unix_now();
+        assert!(peer.read().await.last_seen.abs_diff(now) <= 2);
+        let mut saved = 0;
+        for _ in 0..100 {
+            let rows = rs.pm.db.list_devices().await.unwrap();
+            saved = rows.iter().find(|row| row.id == "simpledesk-tcp").unwrap().last_seen;
+            if saved > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(saved.abs_diff(now) <= 2, "{saved}");
     }
 
     #[hbb_common::tokio::test]

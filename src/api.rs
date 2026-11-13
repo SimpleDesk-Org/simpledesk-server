@@ -4,7 +4,7 @@
 //! src/hbbs_http/), not from any closed server. Errors are `{"error": "..."}`; address book
 //! actions answer 200 with an empty body, because the client treats any body as an error.
 
-use crate::database::AbRow;
+use crate::database::{AbRow, DeviceRow};
 use crate::oidc::ClientLoginState;
 use crate::panel::{hex, Panel};
 use crate::peer::PeerMap;
@@ -28,6 +28,7 @@ pub(crate) fn routes() -> Router {
     Router::new()
         .route("/api/simpledesk/server-info", get(server_info))
         .route("/api/simpledesk/change-id", post(change_id))
+        .route("/api/simpledesk/peer-status", post(peer_status))
         .route("/api/login-options", get(login_options))
         .route("/api/login", post(login))
         .route("/api/oidc/auth", post(oidc_auth))
@@ -104,6 +105,177 @@ pub(crate) async fn may_control(pm: &PeerMap, user: &str, id: &str) -> bool {
         log::error!("SimpleDesk API: reading the owner of {} failed: {}", id, err);
         false
     })
+}
+
+/// The registered devices `user` may see, by the same rule as may_control: all for an admin,
+/// else the own ones and those of the user's groups.
+pub(crate) async fn visible_devices(pm: &PeerMap, user: &str) -> ResultType<Vec<DeviceRow>> {
+    let rows = pm.db.list_devices().await?;
+    if pm.accounts.is_admin(user) {
+        return Ok(rows);
+    }
+    let groups = pm.db.user_groups(user).await?;
+    Ok(rows
+        .into_iter()
+        .filter(|row| {
+            (!row.owner.is_empty() && row.owner == user)
+                || (!row.group.is_empty() && groups.contains(&row.group))
+        })
+        .collect())
+}
+
+pub(crate) fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
+}
+
+/// What the client and the panel show for a device: "Online (Aktiv)", "AFK" or "Offline".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeviceState {
+    Active,
+    Afk,
+    Offline,
+}
+
+impl DeviceState {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            DeviceState::Active => "active",
+            DeviceState::Afk => "afk",
+            DeviceState::Offline => "offline",
+        }
+    }
+}
+
+/// The state of a device and since when (unix seconds). An online device is AFK once its
+/// last input is `afk_secs` old, then `since` is that input. Offline, `since` is when it was
+/// last seen (0 if never). Active, it is the last input, or now if the device tells none.
+pub(crate) fn device_state(
+    online: bool,
+    last_input: Option<u64>,
+    last_seen: u64,
+    now: u64,
+    afk_secs: u64,
+) -> (DeviceState, u64) {
+    if !online {
+        return (DeviceState::Offline, last_seen);
+    }
+    match last_input {
+        Some(input) if now.saturating_sub(input) >= afk_secs => (DeviceState::Afk, input),
+        Some(input) => (DeviceState::Active, input.min(now)),
+        None => (DeviceState::Active, now),
+    }
+}
+
+/// The current state of the registered device `id`; `db_last_seen` is when the database last
+/// saw it.
+pub(crate) async fn current_state(pm: &PeerMap, id: &str, db_last_seen: u64) -> (DeviceState, u64) {
+    let now = unix_now();
+    let afk_secs = pm.accounts.afk_minutes.max(1) as u64 * 60;
+    match pm.get_in_memory(id).await {
+        Some(peer) => {
+            let peer = peer.read().await;
+            let last_seen = peer.last_seen.max(db_last_seen);
+            device_state(peer.is_online(), peer.last_input, last_seen, now, afk_secs)
+        }
+        None => device_state(false, None, db_last_seen, now, afk_secs),
+    }
+}
+
+/// "seit 12 min", "seit 3 h" or "seit 2 Tagen"; '' if `since` is unknown (0).
+pub(crate) fn since_text(since: u64, now: u64) -> String {
+    if since == 0 {
+        return String::new();
+    }
+    let minutes = now.saturating_sub(since) / 60;
+    if minutes < 1 {
+        "seit weniger als 1 min".to_owned()
+    } else if minutes < 120 {
+        format!("seit {} min", minutes)
+    } else if minutes < 48 * 60 {
+        format!("seit {} h", minutes / 60)
+    } else {
+        format!("seit {} Tagen", minutes / (24 * 60))
+    }
+}
+
+/// How often the time a device was last seen is written to the database at most.
+const LAST_SEEN_SAVE_SECS: u64 = 60;
+
+/// The device is alive, and its user's last input was `idle_secs` ago (None from clients that
+/// do not tell). Only for the device registered with this ID and uuid, so nobody can make
+/// another device look AFK.
+async fn note_heartbeat(pm: &PeerMap, id: &str, uuid: &[u8], idle_secs: Option<u64>) {
+    let Some(peer) = pm.get(id).await else {
+        return;
+    };
+    let now = unix_now();
+    let save = {
+        let mut peer = peer.write().await;
+        if peer.uuid.is_empty() || &peer.uuid[..] != uuid {
+            return;
+        }
+        peer.last_seen = now;
+        peer.last_input = idle_secs.map(|idle| now.saturating_sub(idle));
+        if peer.guid.is_empty() || now.saturating_sub(peer.last_seen_saved) < LAST_SEEN_SAVE_SECS {
+            None
+        } else {
+            peer.last_seen_saved = now;
+            Some(peer.guid.clone())
+        }
+    };
+    if let Some(guid) = save {
+        if let Err(err) = pm.db.save_last_seen(&guid, now).await {
+            log::error!("SimpleDesk API: saving when {} was last seen failed: {}", id, err);
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct PeerStatusRequest {
+    #[serde(default)]
+    ids: Vec<String>,
+}
+
+/// More IDs than anybody has in the address book.
+const MAX_STATUS_IDS: usize = 1000;
+
+/// The client asks for the state of the devices in its lists: `{"ids": [...]}`. The answer is
+/// `{"<id>": {"state": "active"|"afk"|"offline", "since": <unix seconds>}}`, only for devices
+/// the user may see. Other and unknown IDs are left out.
+async fn peer_status(Extension(panel): Extension<Arc<Panel>>, headers: HeaderMap, body: Bytes) -> Response {
+    let user = match user_of(&panel, &headers).await {
+        Ok(user) => user,
+        Err(res) => return res,
+    };
+    let Ok(req) = serde_json::from_slice::<PeerStatusRequest>(&body) else {
+        return api_error(StatusCode::BAD_REQUEST, "Ungültige Anfrage.");
+    };
+    if req.ids.len() > MAX_STATUS_IDS {
+        return api_error(StatusCode::BAD_REQUEST, "Zu viele IDs auf einmal.");
+    }
+    let devices: HashMap<String, u64> = match visible_devices(&panel.pm, &user).await {
+        Ok(rows) => rows.into_iter().map(|row| (row.id, row.last_seen)).collect(),
+        Err(err) => {
+            log::error!("SimpleDesk API: reading devices for the status failed: {}", err);
+            return api_error(StatusCode::BAD_REQUEST, "Serverfehler.");
+        }
+    };
+    let mut states = Map::new();
+    for id in req.ids {
+        let id = id.trim();
+        let Some(&db_last_seen) = devices.get(id) else {
+            continue;
+        };
+        if states.contains_key(id) {
+            continue;
+        }
+        let (state, since) = current_state(&panel.pm, id, db_last_seen).await;
+        states.insert(id.to_owned(), json!({ "state": state.as_str(), "since": since }));
+    }
+    Json(Value::Object(states)).into_response()
 }
 
 /// With IDS_BY_ADMIN: whether device `id` may be reached. Only under the ID an admin gave its
@@ -366,24 +538,33 @@ async fn logout(Extension(panel): Extension<Arc<Panel>>, headers: HeaderMap) -> 
 #[derive(Deserialize)]
 struct HeartbeatRequest {
     #[serde(default)]
+    id: String,
+    #[serde(default)]
     uuid: String,
+    /// SimpleDesk client: seconds since the last keyboard or mouse input on the device.
+    #[serde(default)]
+    simpledesk_idle_secs: Option<u64>,
 }
 
 /// Every few seconds from each device (without a token). The answer tells the device the ID
 /// an admin gave it: `assigned_id` differs from its ID, so it switches to it.
 async fn heartbeat(Extension(panel): Extension<Arc<Panel>>, body: Bytes) -> Response {
     let pm = &panel.pm;
-    let assigned = match serde_json::from_slice::<HeartbeatRequest>(&body)
-        .ok()
-        .and_then(|req| base64::decode(req.uuid.trim()).ok())
+    let req = serde_json::from_slice::<HeartbeatRequest>(&body).ok();
+    let assigned = match req
+        .as_ref()
+        .and_then(|req| base64::decode(req.uuid.trim()).ok().map(|uuid| (req, uuid)))
     {
-        Some(uuid) => match pm.db.id_assignment(&uuid).await {
-            Ok(assigned) => assigned,
-            Err(err) => {
-                log::error!("SimpleDesk API: reading an ID for the heartbeat failed: {}", err);
-                None
+        Some((req, uuid)) => {
+            note_heartbeat(pm, req.id.trim(), &uuid, req.simpledesk_idle_secs).await;
+            match pm.db.id_assignment(&uuid).await {
+                Ok(assigned) => assigned,
+                Err(err) => {
+                    log::error!("SimpleDesk API: reading an ID for the heartbeat failed: {}", err);
+                    None
+                }
             }
-        },
+        }
         None => None,
     };
     Json(json!({
@@ -1094,6 +1275,78 @@ mod tests {
         let body = json!({"id": "Kasse-PC", "uuid": base64::encode(b"uuid-kasse")});
         let res = json_of(call(&panel, "POST", "/api/heartbeat", None, Some(body)).await).await;
         assert_eq!(res["simpledesk"], json!({"id_assigned": true, "assigned_id": "Kasse-PC"}));
+    }
+
+    #[test]
+    fn device_state_follows_input_and_connection() {
+        use super::{device_state, since_text, DeviceState::*};
+        let now = 1_000_000;
+        let afk = 5 * 60;
+        assert_eq!(device_state(true, None, 0, now, afk), (Active, now));
+        assert_eq!(device_state(true, Some(now - 60), 0, now, afk), (Active, now - 60));
+        assert_eq!(device_state(true, Some(now - afk), 0, now, afk), (Afk, now - afk));
+        assert_eq!(device_state(false, Some(now - 10), now - 600, now, afk), (Offline, now - 600));
+        assert_eq!(device_state(false, None, 0, now, afk), (Offline, 0));
+        assert_eq!(since_text(now - 30, now), "seit weniger als 1 min");
+        assert_eq!(since_text(now - 12 * 60, now), "seit 12 min");
+        assert_eq!(since_text(now - 3 * 3600, now), "seit 3 h");
+        assert_eq!(since_text(now - 3 * 86400, now), "seit 3 Tagen");
+        assert_eq!(since_text(0, now), "");
+    }
+
+    /// Marks the registered device `id` online, as hbbs does when it registers.
+    async fn come_online(panel: &Arc<Panel>, id: &str) {
+        let peer = panel.pm.get(id).await.unwrap();
+        peer.write().await.last_reg_time = std::time::Instant::now();
+    }
+
+    #[hbb_common::tokio::test]
+    async fn peer_status_tells_active_afk_and_offline_to_who_may_see() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = crate::peer::test_peer_map(&dir).await;
+        pm.accounts = Arc::new(crate::accounts::Accounts::with_admins("felix"));
+        let panel = Arc::new(Panel::new(pm, Default::default()).await.unwrap());
+        let db = &panel.pm.db;
+        for id in ["Anna-PC", "Lager-PC", "Kasse-PC"] {
+            db.insert_peer(id, id.as_bytes(), b"pk", "").await.unwrap();
+        }
+        let felix = login(&panel, "felix").await;
+        let anna = login(&panel, "anna").await;
+        assert!(db.assign_device("Anna-PC", "anna", "").await.unwrap());
+        let heartbeat = |id: &str, uuid: &[u8], idle: u64| {
+            json!({"id": id, "uuid": base64::encode(uuid), "ver": 1001017, "simpledesk_idle_secs": idle})
+        };
+
+        // Anna-PC was used 2 minutes ago, nobody touched Lager-PC for 12 minutes, Kasse-PC is off.
+        come_online(&panel, "Anna-PC").await;
+        come_online(&panel, "Lager-PC").await;
+        for (id, idle) in [("Anna-PC", 120), ("Lager-PC", 12 * 60), ("Kasse-PC", 0)] {
+            let res = call(&panel, "POST", "/api/heartbeat", None, Some(heartbeat(id, id.as_bytes(), idle))).await;
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+        // A heartbeat with another uuid changes nothing.
+        let fake = heartbeat("Anna-PC", b"fremd", 3600);
+        assert_eq!(call(&panel, "POST", "/api/heartbeat", None, Some(fake)).await.status(), StatusCode::OK);
+
+        let ids = json!({"ids": ["Anna-PC", "Lager-PC", "Kasse-PC", "Gibt-Es-Nicht"]});
+        let path = "/api/simpledesk/peer-status";
+        let res = json_of(call(&panel, "POST", path, Some(&felix), Some(ids.clone())).await).await;
+        let now = super::unix_now();
+        let since = |id: &str| res[id]["since"].as_u64().unwrap();
+        assert_eq!(res["Anna-PC"]["state"], "active");
+        assert!(since("Anna-PC").abs_diff(now - 120) <= 2, "{res}");
+        assert_eq!(res["Lager-PC"]["state"], "afk");
+        assert!(since("Lager-PC").abs_diff(now - 12 * 60) <= 2, "{res}");
+        assert_eq!(res["Kasse-PC"]["state"], "offline");
+        assert!(since("Kasse-PC").abs_diff(now) <= 2, "{res}");
+        assert!(res.get("Gibt-Es-Nicht").is_none(), "{res}");
+
+        // anna sees only her own device; without a token nobody sees anything.
+        let res = json_of(call(&panel, "POST", path, Some(&anna), Some(ids.clone())).await).await;
+        assert_eq!(res.as_object().unwrap().keys().collect::<Vec<_>>(), ["Anna-PC"]);
+        assert_eq!(call(&panel, "POST", path, None, Some(ids)).await.status(), StatusCode::UNAUTHORIZED);
+        let res = call(&panel, "POST", path, Some(&anna), Some(json!("kein Objekt"))).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
     #[hbb_common::tokio::test]

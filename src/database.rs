@@ -216,6 +216,11 @@ impl Database {
                 rule integer not null,
                 primary key (ab, kind, name)
             )",
+            // When a device (by guid) was last seen, in unix seconds, for "Offline seit".
+            "create table if not exists device_seen (
+                guid blob primary key not null,
+                last_seen integer not null
+            )",
         ] {
             sqlx::query(statement)
                 .execute(self.pool.get().await?.deref_mut())
@@ -837,20 +842,21 @@ impl Database {
     /// All registered devices with owner, group, the ID an admin gave them and what they
     /// told about themselves, sorted by id.
     pub async fn list_devices(&self) -> ResultType<Vec<DeviceRow>> {
-        type Row = (String, String, String, String, String, Option<String>, String);
+        type Row = (String, String, String, String, String, Option<String>, String, i64);
         let rows = sqlx::query_as::<_, Row>(
             "select p.id, p.info, cast(p.created_at as text), coalesce(o.owner, ''), coalesce(o.grp, ''),
-                d.assigned_id, coalesce(i.data, '')
+                d.assigned_id, coalesce(i.data, ''), coalesce(s.last_seen, 0)
              from peer p left join device_owner o on o.guid = p.guid
                 left join device_id d on d.uuid = p.uuid
                 left join device_info i on i.uuid = p.uuid
+                left join device_seen s on s.guid = p.guid
              order by p.id collate nocase",
         )
         .fetch_all(self.pool.get().await?.deref_mut())
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(id, info, registered, owner, group, assigned_id, sysinfo)| DeviceRow {
+            .map(|(id, info, registered, owner, group, assigned_id, sysinfo, last_seen)| DeviceRow {
                 id,
                 info,
                 registered,
@@ -858,8 +864,19 @@ impl Database {
                 group,
                 assigned_id,
                 sysinfo,
+                last_seen: last_seen.max(0) as u64,
             })
             .collect())
+    }
+
+    /// Notes when the device with this guid was last seen (unix seconds).
+    pub async fn save_last_seen(&self, guid: &[u8], last_seen: u64) -> ResultType<()> {
+        sqlx::query("insert or replace into device_seen(guid, last_seen) values(?, ?)")
+            .bind(guid)
+            .bind(last_seen as i64)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
     }
 
     /// Owner and group of a device, ('', '') without; None if there is no such device.
@@ -933,6 +950,8 @@ pub struct DeviceRow {
     pub assigned_id: Option<String>,
     /// The device's last system info as JSON, '' if it sent none.
     pub sysinfo: String,
+    /// When the device was last seen (unix seconds) as the database knows it, 0 if never.
+    pub last_seen: u64,
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@
   --line: #dde3ea;
   --accent: #1f6feb;
   --on: #1a9c4b;
+  --afk: #d4a017;
   --off: #a7b1bc;
   --error: #c62828;
 }
@@ -18,6 +19,7 @@
     --line: #2b3540;
     --accent: #4f8ff7;
     --on: #3fbf6f;
+    --afk: #e3b341;
     --off: #5c6773;
     --error: #ef6461;
   }
@@ -103,6 +105,7 @@ th { color: var(--muted); font-weight: 600; font-size: 13px; }
 td.id { font-weight: 600; }
 .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 7px; }
 .dot.on { background: var(--on); }
+.dot.afk { background: var(--afk); }
 .dot.off { background: var(--off); }
 @media (max-width: 640px) {
   th:nth-child(5), td:nth-child(5) { display: none; }

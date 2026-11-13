@@ -56,7 +56,7 @@
       {% for device in devices %}
       <tr>
         <td class="id">{{ device.id }}{% if !device.pending_id.is_empty() %}<span class="pending">wird zu {{ device.pending_id }}</span>{% endif %}</td>
-        <td>{% if device.online %}<span class="dot on"></span>online{% else %}<span class="dot off"></span>offline{% endif %}</td>
+        <td>{% if device.state == "active" %}<span class="dot on"></span>Online (Aktiv){% else if device.state == "afk" %}<span class="dot afk"></span>AFK ({{ device.since }}){% else %}<span class="dot off"></span>Offline{% if !device.since.is_empty() %} ({{ device.since }}){% endif %}{% endif %}</td>
         <td>{% if device.online %}{% if device.websocket %}WebSocket (443){% else %}UDP{% endif %}{% else %}–{% endif %}</td>
         <td>{{ device.ip }}</td>
         <td>{{ device.registered }}</td>
