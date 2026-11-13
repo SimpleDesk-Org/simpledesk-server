@@ -107,6 +107,8 @@ td.id { font-weight: 600; }
 @media (max-width: 640px) {
   th:nth-child(5), td:nth-child(5) { display: none; }
 }
+footer.source { margin: 0 auto 32px; padding: 0 16px; text-align: center; font-size: 13px; color: var(--muted); }
+footer.source a { color: var(--muted); }
 .table-wrap { overflow-x: auto; }
 button.link.danger { color: var(--error); }
 label select { display: block; margin-top: 6px; }
