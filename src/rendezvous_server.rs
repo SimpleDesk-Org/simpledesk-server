@@ -748,7 +748,16 @@ impl RendezvousServer {
             }
         }
         if changed {
-            self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
+            // SimpleDesk, IDS_BY_ADMIN: the admins get a mail when a new device waits for an ID.
+            let is_new = peer.read().await.uuid.is_empty();
+            let announce = (is_new && self.pm.accounts.ids_by_admin && crate::mail::enabled())
+                .then(|| (rk.uuid.to_vec(), id.clone(), ip.clone()));
+            let res = self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
+            if let Some((uuid, id, ip)) = announce.filter(|_| res == register_pk_response::Result::OK) {
+                if let Ok(None) = self.pm.db.id_assignment(&uuid).await {
+                    crate::mail::send_new_device(&uuid, &id, &ip);
+                }
+            }
         }
         Some(register_pk_response::Result::OK)
     }

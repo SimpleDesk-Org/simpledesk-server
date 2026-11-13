@@ -54,6 +54,8 @@ ping = "0.4.0"
 flate2 = "1.0"
 # SimpleDesk: HTML templates of the web panel
 askama = "0.16"
+# SimpleDesk: alarm mails over SMTP, TLS with rustls (no OpenSSL)
+lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "smtp-transport", "tokio1-rustls-tls"] }
 
 [dev-dependencies]
 # SimpleDesk: tests of the web panel

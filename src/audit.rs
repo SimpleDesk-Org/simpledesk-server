@@ -393,6 +393,16 @@ async fn alarm_record(pm: &PeerMap, guid: Vec<u8>, id: String, record: &Map<Stri
         ..Default::default()
     };
     db.insert_audit(&row).await?;
+    let alarm = crate::mail::Alarm {
+        device_id: &row.device_id,
+        what: &row.detail,
+        time: &crate::panel::time_text(now),
+        user: &row.user,
+        peer_id: &row.peer_id,
+        peer_name: &row.peer_name,
+        ip: &row.ip,
+    };
+    crate::mail::send_alarm(&alarm, now);
     Ok(())
 }
 

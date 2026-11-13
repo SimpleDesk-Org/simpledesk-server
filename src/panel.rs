@@ -731,7 +731,7 @@ fn day_start(text: &str) -> Result<Option<u64>, ()> {
 }
 
 /// "13.11.2026 09:41:07" (UTC).
-fn time_text(secs: u64) -> String {
+pub(crate) fn time_text(secs: u64) -> String {
     chrono::DateTime::from_timestamp(secs as i64, 0)
         .map(|time| time.format("%d.%m.%Y %H:%M:%S").to_string())
         .unwrap_or_default()

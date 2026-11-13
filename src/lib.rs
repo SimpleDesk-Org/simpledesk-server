@@ -6,6 +6,7 @@ mod oidc;
 mod accounts;
 mod api;
 mod audit;
+mod mail;
 mod panel;
 mod peer;
 mod version;
