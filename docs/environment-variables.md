@@ -178,7 +178,7 @@ image, the working directory is `/data`.
 
 ## Docker image variables
 
-The supervisor image (`rustdesk/rustdesk-server-s6`) starts both binaries with
+The supervisor image (built from `docker/Dockerfile`) starts both binaries with
 s6 and adds a few convenience variables handled by its service scripts, **not**
 by `hbbs`/`hbbr` directly:
 
@@ -192,7 +192,7 @@ by `hbbs`/`hbbr` directly:
 Any variable from the tables above can also be passed straight through the
 container's environment (e.g. `-e ALWAYS_USE_RELAY=Y`, `-e RUST_LOG=debug`).
 
-The classic scratch image (`rustdesk/rustdesk-server`) contains only the
+The classic scratch image (built from `docker-classic/Dockerfile`) contains only the
 binaries and does **not** implement `RELAY`, `ENCRYPTED_ONLY`, `KEY_PUB`, or
 `KEY_PRIV`; those variables are ignored by that image.
 
@@ -221,7 +221,7 @@ PORT=22116
 ```yaml
 services:
   rustdesk-server:
-    image: rustdesk/rustdesk-server-s6:latest
+    image: simpledesk-server-s6:latest # built from docker/Dockerfile
     environment:
       - RELAY=rustdesk.example.com:21117
       - ALWAYS_USE_RELAY=Y
