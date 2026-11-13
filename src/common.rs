@@ -138,7 +138,7 @@ pub fn set_arg(name: &str, value: &str) {
 pub fn init_args(args: &str, name: &str, about: &str) {
     let matches = App::new(name)
         .version(crate::version::VERSION)
-        .author("Purslane Ltd. <info@rustdesk.com>")
+        .author("Purslane Ltd.")
         .about(about)
         .args_from_usage(args)
         .get_matches();
