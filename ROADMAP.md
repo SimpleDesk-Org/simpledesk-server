@@ -27,6 +27,11 @@ Gearbeitet wird jeweils auf dem Branch `simpledesk`.
 - Eigener Server läuft mit dem SimpleDesk-Image (remote.felixthedev.com)
 - Anmeldung nur über Eider (OIDC), live mit www.klg-orga.de. SimpleDesk hat keine Konten mit Benutzername und Passwort.
 - Verbinden nur mit Anmeldung (`LOGIN_REQUIRED=Y`)
+- Server-Info für die Ersteinrichtung des Clients (`/api/simpledesk/server-info`)
+- Anmeldungen laufen ab: Client nach `TOKEN_DAYS` (14), Panel nach `PANEL_SESSION_HOURS` (8)
+- Rollen Admin (`ADMIN_USERS`) und Benutzer, Seite „Benutzer“ mit Abmelden, Sperren und Gruppen
+- Geräte haben Besitzer und Gruppe. Benutzer sehen und steuern nur ihre Geräte und die ihrer Gruppen, Admins alle.
+- Geteilte Adressbücher mit den Rechten lesen, schreiben und voll (Client und Panel)
 
 ## Als Nächstes
 
@@ -35,7 +40,7 @@ Gearbeitet wird jeweils auf dem Branch `simpledesk`.
 3. Echter Test mit zwei Clients
 4. Client: Icons und Installer mit SimpleDesk-Namen
 5. Client: nur noch erlaubte Server (Allowlist für klg-orga.de und felixthedev.com)
-6. Rollen: im Moment sieht jeder mit Lizenz im Panel alle Geräte
+6. Client: Liste „Zugängliche Geräte“ (`/api/peers`) mit den eigenen Geräten und denen der Gruppen
 
 ## Pro-Funktionen
 
@@ -44,13 +49,13 @@ Gearbeitet wird jeweils auf dem Branch `simpledesk`.
 | Verbindung über WebSocket/HTTPS | fertig |
 | ID ändern | fertig |
 | Eigener Client mit festen Einstellungen | Grundlage fertig (SimpleDesk-Schlüssel), Generator fehlt |
-| Web-Panel | angefangen: Anmelden über Eider, Geräteliste, Adressbuch |
+| Web-Panel | Anmelden über Eider, Geräte mit Besitzer und Gruppe, Adressbücher, Benutzer und Gruppen |
 | Login im Client mit Konto | über Eider im Browser, Anmeldefenster im Client wird gebaut |
 | Login mit 2FA | über Eider |
-| Geräteverwaltung und Online-Status | Online-Status fertig, Verwalten offen |
-| Adressbuch | persönliches Adressbuch fertig (Client und Panel), geteilte offen |
+| Geräteverwaltung und Online-Status | Online-Status, Besitzer und Gruppe fertig, Löschen und Deaktivieren offen |
+| Adressbuch | persönliche und geteilte Adressbücher fertig (Client und Panel) |
 | Audit-Log (Verbindungen, Dateien, Alarme) | offen |
-| Zugriffsrechte, Rollen Admin und Control | offen |
+| Zugriffsrechte, Rollen Admin und Control | Admin und Benutzer, Gruppen, Gerätebesitzer und Sperren fertig |
 | Zentrale Einstellungen für alle Clients | offen |
 | Geräte zentral einrichten | offen |
 | Mehrere Relays, das nächste automatisch | offen |

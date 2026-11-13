@@ -7,9 +7,9 @@ SimpleDesk ist ein Fork des kostenlosen RustDesk-Servers ([rustdesk/rustdesk-ser
 - Geräte können sich auch über TCP und WebSocket anmelden, nicht nur über UDP. Die Verbindung bleibt offen, der Server schickt alle 20 Sekunden ein Lebenszeichen, und Anfragen anderer Geräte kommen über diese Verbindung.
 - Neuer Schalter `WS_ONLY=Y` für hbbs und hbbr: Nur die WebSocket-Ports (21118 und 21119) lauschen auf der Bind-Adresse, alle anderen Ports nur auf 127.0.0.1. Verbindungen laufen dann immer über das Relay.
 - Ein Gerät kann seine ID ändern (`--set-id`).
-- Web-Panel in hbbs auf Port 21114: Anmelden über Eider, Geräteliste mit Online-Status, persönliches Adressbuch. Abschalten mit `PANEL=N`.
-- API für den Client auf demselben Port: Anmelden über Eider im Browser und persönliches Adressbuch mit Einträgen und Tags. Heartbeat und Systeminfo werden ruhig beantwortet.
-- Neuer Schalter `LOGIN_REQUIRED=Y` (im Docker-Image Standard): Verbinden darf nur, wer im Client angemeldet ist. Der Server prüft den Token, den der Client mit jeder Verbindungsanfrage schickt. Ohne Anmeldung sieht man „Bitte melde dich in SimpleDesk an“. Das gilt auch für den normalen RustDesk-Client. Geräte, auf die man zugreift, brauchen keine Anmeldung.
+- Web-Panel in hbbs auf Port 21114: Anmelden über Eider, Geräteliste mit Online-Status, Besitzer und Gruppe, eigenes und geteilte Adressbücher, für Admins die Seite „Benutzer“. Abschalten mit `PANEL=N`.
+- API für den Client auf demselben Port: Anmelden über Eider im Browser, eigenes und geteilte Adressbücher mit Einträgen und Tags. Heartbeat und Systeminfo werden ruhig beantwortet. `GET /api/simpledesk/server-info` nennt ohne Anmeldung den Key des Servers (wie in `id_ed25519.pub`), damit der Client sich beim ersten Start selbst einrichten kann.
+- Neuer Schalter `LOGIN_REQUIRED=Y` (im Docker-Image Standard): Verbinden darf nur, wer im Client angemeldet ist und das Gerät steuern darf (siehe unten). Der Server prüft den Token, den der Client mit jeder Verbindungsanfrage schickt. Ohne Anmeldung sieht man „Bitte melde dich in SimpleDesk an“, ohne Recht „Du darfst dieses Gerät nicht steuern.“ Das gilt auch für den normalen RustDesk-Client. Geräte, auf die man zugreift, brauchen keine Anmeldung.
 
 ## Anmeldung über Eider oder einen anderen OIDC-Anbieter
 
@@ -24,6 +24,33 @@ Es gibt keine Konten mit Benutzername und Passwort in SimpleDesk. Panel und Clie
 | `PANEL_URL` | öffentliche Adresse des Panels, zum Beispiel `https://remote.example`. Die Rücksprung-Adresse ist `PANEL_URL/oidc/callback`. |
 
 Der Anbieter muss Discovery, den Code-Flow mit PKCE (S256) und ein ID-Token mit HS256 und dem Client-Geheimnis können. Ein Konto aus dem Anbieter hat hier kein eigenes Passwort.
+
+## Admins, Rechte und Ablauf der Anmeldung
+
+| Variable | Bedeutung |
+|---|---|
+| `ADMIN_USERS` | Admins, mit Komma getrennt, zum Beispiel `felix,it-admin`. Es sind die Benutzernamen bei Eider, groß oder klein ist egal. |
+| `TOKEN_DAYS` | So viele Tage bleibt der Client nach der Anmeldung angemeldet. Standard `14`. |
+| `PANEL_SESSION_HOURS` | So viele Stunden bleibt das Panel nach der Anmeldung angemeldet. Standard `8`. |
+
+**Setz `ADMIN_USERS` vor dem Update.** Ohne Admins kann niemand die Seite „Benutzer“ öffnen, und Geräte ohne Besitzer kann mit `LOGIN_REQUIRED=Y` niemand mehr steuern.
+
+- **Admins** sehen und steuern alle Geräte, auch Geräte ohne Besitzer. Sie haben im Panel die Seite „Benutzer“. Admin ist nur, wer in `ADMIN_USERS` steht. Im Panel kann man Admins nicht sperren.
+- **Benutzer** sehen und steuern nur ihre eigenen Geräte und die Geräte ihrer Gruppen.
+- **Besitzer:** Ein Gerät gehört dem, der sich zuletzt im Client darauf anmeldet. Meldet sich ein Admin an, bleibt der Besitzer gleich. Auf der Seite „Geräte“ können Admins Besitzer und Gruppe von Hand setzen.
+- **Gruppen** legen Admins auf der Seite „Benutzer“ an. Dort fügen sie auch Leute hinzu.
+- **Abmelden** (Seite „Benutzer“) beendet alle Anmeldungen einer Person in Clients und Panel. Danach kann sie sich wieder anmelden. **Sperren** meldet sie ab, und sie kommt nicht mehr herein, bis ein Admin sie entsperrt.
+- **Ablauf:** Eider gibt keine Refresh-Tokens heraus. SimpleDesk prüft die Lizenz also nur bei der Anmeldung. Verliert jemand bei Eider die Lizenz, bleibt er höchstens `TOKEN_DAYS` Tage angemeldet. Soll es sofort gelten, klick auf „Sperren“. Ist die Anmeldung abgelaufen, meldet sich der Client von selbst ab.
+
+## Geteilte Adressbücher
+
+Im Panel unter „Adressbuch“ legt jeder geteilte Adressbücher an und teilt sie mit Benutzern oder Gruppen:
+
+- **lesen:** ansehen und verbinden
+- **schreiben:** zusätzlich Einträge und Tags ändern
+- **voll:** zusätzlich teilen, umbenennen und löschen
+
+Wer ein Adressbuch anlegt, und alle Admins haben „voll“. Der Client zeigt die geteilten Adressbücher neben dem eigenen. Passwörter, die jemand in einem geteilten Adressbuch speichert, sehen alle, mit denen es geteilt ist. Das eigene Adressbuch sieht nur man selbst, auch kein Admin.
 
 ## Betrieb nur über Port 443
 
