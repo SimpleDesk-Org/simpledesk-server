@@ -1,0 +1,75 @@
+{% extends "panel/base.html" %}
+{% block title %}Einrichten{% endblock %}
+{% block nav %}{% include "panel/nav.html" %}{% endblock %}
+{% block banner %}{% include "panel/update.html" %}{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>Geräte zentral einrichten</h1>
+  <p class="hint">Hier bekommst du einen Befehl für Windows. Er stellt ein installiertes SimpleDesk auf diesen Server ein und gibt dem Gerät Besitzer, Gruppe und einen Eintrag im Adressbuch. Den Befehl kannst du auf beliebig vielen Geräten ausführen, solange der Token gilt.</p>
+  {% if !error.is_empty() %}<p class="error">{{ error }}</p>{% endif %}
+  {% if !command.is_empty() %}
+  <div class="new-token">
+    <p class="ok">Der Token ist erstellt. Kopier den Befehl jetzt: Den Token zeigt das Panel nur dieses eine Mal.</p>
+    <p class="hint">Auf dem Gerät PowerShell als Administrator öffnen, den Befehl einfügen und Enter drücken. Am Ende steht „Fertig“.</p>
+    <pre id="command"><code>{{ command }}</code></pre>
+    <button type="button" onclick="navigator.clipboard.writeText(document.getElementById('command').innerText)">Befehl kopieren</button>
+  </div>
+  {% endif %}
+  <form method="post" action="/deploy/new">
+    <div class="grid">
+      <label>Gültig für
+        <select name="hours">{% for choice in hours %}<option value="{{ choice.value }}"{% if choice.selected %} selected{% endif %}>{{ choice.label }}</option>{% endfor %}</select>
+      </label>
+      <label>Notiz (optional)
+        <input name="note" value="{{ note }}" maxlength="100" placeholder="zum Beispiel Umzug Rathaus">
+      </label>
+      <label>Besitzer
+        <select name="owner">{% for choice in users %}<option value="{{ choice.value }}"{% if choice.selected %} selected{% endif %}>{{ choice.label }}</option>{% endfor %}</select>
+      </label>
+      <label>Gruppe
+        <select name="group">{% for choice in groups %}<option value="{{ choice.value }}"{% if choice.selected %} selected{% endif %}>{{ choice.label }}</option>{% endfor %}</select>
+      </label>
+      <label>Geteiltes Adressbuch
+        <select name="book">{% for choice in books %}<option value="{{ choice.value }}"{% if choice.selected %} selected{% endif %}>{{ choice.label }}</option>{% endfor %}</select>
+      </label>
+      <label>Tag im Adressbuch (optional)
+        <input name="tag" value="{{ tag }}" maxlength="100">
+      </label>
+    </div>
+    <p class="hint">Wähl mindestens Besitzer, Gruppe oder Adressbuch. Die Einstellungen bekommt das Gerät über seine Gruppe (Seite „Einstellungen“). Ohne Besitzer gehört das Gerät dem, der sich darauf anmeldet.</p>
+    <button type="submit">Token und Befehl erstellen</button>
+  </form>
+</section>
+
+<section class="card add">
+  <h2>Tokens</h2>
+  {% if tokens.is_empty() %}
+  <p class="empty">Es gibt noch keinen Token.</p>
+  {% else %}
+  <div class="table-wrap">
+  <table>
+    <thead>
+      <tr><th>Erstellt (UTC)</th><th>von</th><th>Gültig bis (UTC)</th><th>Notiz</th><th>Geräte</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for token in tokens %}
+      <tr>
+        <td>{{ token.created }}</td>
+        <td>{{ token.created_by }}</td>
+        <td>{{ token.expires }}{% if token.expired %} <span class="badge quiet">abgelaufen</span>{% endif %}</td>
+        <td>{% if token.note.is_empty() %}–{% else %}{{ token.note }}{% endif %}</td>
+        <td>{{ token.uses }}</td>
+        <td class="actions">
+          <form method="post" action="/deploy/revoke">
+            <input type="hidden" name="id" value="{{ token.id }}">
+            <button class="link danger" type="submit">Löschen</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+</section>
+{% endblock %}

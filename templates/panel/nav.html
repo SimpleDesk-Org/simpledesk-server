@@ -3,7 +3,8 @@
   <a href="/ab"{% if active == "ab" %} class="active"{% endif %}>Adressbuch</a>
   <a href="/log"{% if active == "log" %} class="active"{% endif %}>Protokoll</a>
   {% if admin %}<a href="/users"{% if active == "users" %} class="active"{% endif %}>Benutzer</a>
-  <a href="/settings"{% if active == "settings" %} class="active"{% endif %}>Einstellungen</a>{% endif %}
+  <a href="/settings"{% if active == "settings" %} class="active"{% endif %}>Einstellungen</a>
+  <a href="/deploy"{% if active == "deploy" %} class="active"{% endif %}>Einrichten</a>{% endif %}
   <span class="user">{{ user }}{% if admin %} (Admin){% endif %}</span>
   <form method="post" action="/logout"><button class="link" type="submit">Abmelden</button></form>
 </nav>

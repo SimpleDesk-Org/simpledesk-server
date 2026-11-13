@@ -43,6 +43,7 @@ pub(crate) fn routes() -> Router {
         .route("/api/users", get(empty_page))
         .route("/api/peers", get(empty_page))
         .route("/api/audit/*rest", any(crate::audit::audit))
+        .route("/api/devices/cli", post(crate::deploy::devices_cli))
 }
 
 fn api_error(status: StatusCode, msg: &str) -> Response {
@@ -377,7 +378,7 @@ async fn take_device(panel: &Panel, user: &str, id: &str, uuid: &str) {
     }
 }
 
-fn bearer(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)?
         .to_str()

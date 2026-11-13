@@ -265,6 +265,21 @@ impl Database {
         )
         .execute(self.pool.get().await?.deref_mut())
         .await?;
+        // Tokens for setting up devices from the command line (--assign), stored only as a
+        // hash. Times are unix seconds.
+        sqlx::query(
+            "create table if not exists deploy_token (
+                id integer primary key autoincrement,
+                token_hash varchar(64) not null unique,
+                created_by varchar(100) not null,
+                created_at integer not null,
+                expires_at integer not null,
+                note varchar(100) not null default '',
+                uses integer not null default 0
+            )",
+        )
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
         Ok(())
     }
 
@@ -1154,6 +1169,96 @@ impl Database {
         Ok(Some((group, options)))
     }
 
+    pub async fn insert_deploy_token(&self, token_hash: &str, created_by: &str, created_at: u64, expires_at: u64, note: &str) -> ResultType<()> {
+        let mut conn = self.pool.get().await?;
+        // Tokens that ran out more than a week ago are of no use, also not in the list.
+        sqlx::query("delete from deploy_token where expires_at < ?")
+            .bind(created_at.saturating_sub(7 * 24 * 3600) as i64)
+            .execute(conn.deref_mut())
+            .await?;
+        sqlx::query("insert into deploy_token(token_hash, created_by, created_at, expires_at, note) values(?, ?, ?, ?, ?)")
+            .bind(token_hash)
+            .bind(created_by)
+            .bind(created_at as i64)
+            .bind(expires_at as i64)
+            .bind(note)
+            .execute(conn.deref_mut())
+            .await?;
+        Ok(())
+    }
+
+    /// Who created the deploy token with this hash, if it is valid at `now`.
+    pub async fn deploy_token_creator(&self, token_hash: &str, now: u64) -> ResultType<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "select created_by from deploy_token where token_hash = ? and expires_at > ?",
+        )
+        .bind(token_hash)
+        .bind(now as i64)
+        .fetch_optional(self.pool.get().await?.deref_mut())
+        .await?)
+    }
+
+    /// Counts a device set up with the deploy token with this hash.
+    pub async fn count_deploy_use(&self, token_hash: &str) -> ResultType<()> {
+        sqlx::query("update deploy_token set uses = uses + 1 where token_hash = ?")
+            .bind(token_hash)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
+    }
+
+    /// All deploy tokens, the newest first.
+    pub async fn list_deploy_tokens(&self) -> ResultType<Vec<DeployTokenRow>> {
+        type Row = (i64, String, i64, i64, String, i64);
+        let rows = sqlx::query_as::<_, Row>(
+            "select id, created_by, created_at, expires_at, note, uses from deploy_token order by id desc",
+        )
+        .fetch_all(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, created_by, created_at, expires_at, note, uses)| DeployTokenRow {
+                id,
+                created_by,
+                created_at: created_at.max(0) as u64,
+                expires_at: expires_at.max(0) as u64,
+                note,
+                uses,
+            })
+            .collect())
+    }
+
+    pub async fn delete_deploy_token(&self, id: i64) -> ResultType<()> {
+        sqlx::query("delete from deploy_token where id = ?")
+            .bind(id)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
+    }
+
+    /// The shared address book with this name (upper and lower case do not matter).
+    pub async fn shared_ab_by_name(&self, name: &str) -> ResultType<Option<AbRow>> {
+        let row = sqlx::query_as::<_, (String, String, String)>(
+            "select guid, owner, name from ab where personal = 0 and name = ? collate nocase",
+        )
+        .bind(name)
+        .fetch_optional(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(row.map(|(guid, owner, name)| AbRow {
+            guid,
+            owner,
+            name,
+            personal: false,
+        }))
+    }
+
+    /// The names of all shared address books.
+    pub async fn shared_ab_names(&self) -> ResultType<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>("select name from ab where personal = 0 order by name collate nocase")
+            .fetch_all(self.pool.get().await?.deref_mut())
+            .await?)
+    }
+
     /// The user signed in on a device becomes its owner, if the device with this ID was
     /// registered with this uuid. The group stays. False if no such device is registered.
     pub async fn set_owner_from_login(&self, id: &str, uuid: &[u8], owner: &str) -> ResultType<bool> {
@@ -1187,6 +1292,16 @@ pub struct UserRow {
     pub blocked: bool,
     /// Last use of a client token or panel session, UTC, '' if never noted.
     pub last_active: String,
+}
+
+/// A token for setting up devices (see deploy_token).
+pub struct DeployTokenRow {
+    pub id: i64,
+    pub created_by: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub note: String,
+    pub uses: i64,
 }
 
 /// A registered device with its owner and group ('' for none).

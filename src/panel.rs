@@ -31,7 +31,7 @@ use std::{
 const COOKIE_NAME: &str = "simpledesk_session";
 const MAX_ID_LEN: usize = 100;
 // Color of tags created in the panel (ARGB, the panel's blue).
-const DEFAULT_TAG_COLOR: i64 = 0xFF1F6FEB;
+pub(crate) const DEFAULT_TAG_COLOR: i64 = 0xFF1F6FEB;
 
 const PANEL_CSS: &str = include_str!("../templates/panel/panel.css");
 // The SimpleDesk icon, from branding/ in the client repository.
@@ -665,6 +665,9 @@ pub(crate) fn router(panel: Arc<Panel>) -> Router {
         .route("/groups/leave", post(groups_leave))
         .route("/settings", get(crate::strategy::settings_page))
         .route("/settings/save", post(crate::strategy::settings_save))
+        .route("/deploy", get(crate::deploy::deploy_page))
+        .route("/deploy/new", post(crate::deploy::deploy_new))
+        .route("/deploy/revoke", post(crate::deploy::deploy_revoke))
         .route("/oidc/login", get(oidc_login))
         .route("/oidc/callback", get(oidc_callback))
         .route("/panel.css", get(css))
