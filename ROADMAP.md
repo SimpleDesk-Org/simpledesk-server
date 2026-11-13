@@ -34,6 +34,10 @@ Gearbeitet wird jeweils auf dem Branch `simpledesk`.
 - Geteilte Adressbücher mit den Rechten lesen, schreiben und voll (Client und Panel)
 - IDs vergibt nur ein Admin (`IDS_BY_ADMIN=Y`): neue Geräte im Panel, „ID vergeben“ und „ID ändern“, das Gerät übernimmt die ID über den Heartbeat
 - Panel verlinkt auf jeder Seite den Quellcode (AGPL)
+- Online-Status über WebSocket: hbbs beantwortet die Abfrage auch auf `/ws/id` (vorher war jedes Gerät „Offline“)
+- Status Aktiv, AFK (`AFK_MINUTES`) und Offline mit „seit“, im Panel und über `/api/simpledesk/peer-status`
+- Seite „Protokoll“: Verbindungen, Dateien, Alarme und Änderungen im Panel (`AUDIT_DAYS`)
+- Alarm-Mails über SMTP, auch wenn ein neues Gerät auf seine ID wartet
 
 ## Als Nächstes
 
@@ -43,6 +47,7 @@ Gearbeitet wird jeweils auf dem Branch `simpledesk`.
 4. Client: Icons und Installer mit SimpleDesk-Namen
 5. Client: nur noch erlaubte Server (Allowlist für klg-orga.de und felixthedev.com)
 6. Client: Liste „Zugängliche Geräte“ (`/api/peers`) mit den eigenen Geräten und denen der Gruppen
+7. Client: `simpledesk_idle_secs` im Heartbeat schicken und Aktiv, AFK und Offline an den Geräten zeigen
 
 ## Pro-Funktionen
 
@@ -51,19 +56,19 @@ Gearbeitet wird jeweils auf dem Branch `simpledesk`.
 | Verbindung über WebSocket/HTTPS | fertig |
 | ID ändern | fertig |
 | Eigener Client mit festen Einstellungen | Grundlage fertig (SimpleDesk-Schlüssel), Generator fehlt |
-| Web-Panel | Anmelden über Eider, Geräte mit Besitzer und Gruppe, Adressbücher, Benutzer und Gruppen |
+| Web-Panel | Anmelden über Eider, Geräte mit Status, Besitzer und Gruppe, Adressbücher, Protokoll, Benutzer und Gruppen |
 | Login im Client mit Konto | über Eider im Browser, Anmeldefenster im Client wird gebaut |
 | Login mit 2FA | über Eider |
-| Geräteverwaltung und Online-Status | Online-Status, Besitzer und Gruppe fertig, Löschen und Deaktivieren offen |
+| Geräteverwaltung und Online-Status | Status Aktiv, AFK und Offline, Besitzer und Gruppe fertig (Anzeige im Client folgt), Löschen und Deaktivieren offen |
 | Adressbuch | persönliche und geteilte Adressbücher fertig (Client und Panel) |
-| Audit-Log (Verbindungen, Dateien, Alarme) | offen |
+| Audit-Log (Verbindungen, Dateien, Alarme) | fertig: Seite „Protokoll“, auch Änderungen im Panel |
 | Zugriffsrechte, Rollen Admin und Control | Admin und Benutzer, Gruppen, Gerätebesitzer und Sperren fertig |
 | Zentrale Einstellungen für alle Clients | offen |
 | Geräte zentral einrichten | offen |
 | Mehrere Relays, das nächste automatisch | offen |
 | OIDC (Eider) | fertig und live, einziger Weg zum Anmelden |
 | LDAP (AD) | offen |
-| SMTP für Mails | offen |
+| SMTP für Mails | Alarm-Mails und „neues Gerät wartet“ fertig |
 | Web-Client selbst hosten | offen |
 
 Das Web-Panel wird mit axum und askama gebaut (wie Eider) und läuft in hbbs.

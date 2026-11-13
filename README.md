@@ -7,8 +7,9 @@ SimpleDesk ist ein Fork des kostenlosen RustDesk-Servers ([rustdesk/rustdesk-ser
 - Geräte können sich auch über TCP und WebSocket anmelden, nicht nur über UDP. Die Verbindung bleibt offen, der Server schickt alle 20 Sekunden ein Lebenszeichen, und Anfragen anderer Geräte kommen über diese Verbindung.
 - Neuer Schalter `WS_ONLY=Y` für hbbs und hbbr: Nur die WebSocket-Ports (21118 und 21119) lauschen auf der Bind-Adresse, alle anderen Ports nur auf 127.0.0.1. Verbindungen laufen dann immer über das Relay.
 - Ein Gerät kann seine ID ändern (`--set-id`), mit `IDS_BY_ADMIN=Y` aber nur auf die ID, die ein Admin vergeben hat.
-- Web-Panel in hbbs auf Port 21114: Anmelden über Eider, Geräteliste mit Online-Status, Besitzer und Gruppe, eigenes und geteilte Adressbücher, für Admins die Seite „Benutzer“. Abschalten mit `PANEL=N`.
-- API für den Client auf demselben Port: Anmelden über Eider im Browser, eigenes und geteilte Adressbücher mit Einträgen und Tags. Heartbeat und Systeminfo werden ruhig beantwortet. `GET /api/simpledesk/server-info` nennt ohne Anmeldung den Key des Servers (wie in `id_ed25519.pub`), damit der Client sich beim ersten Start selbst einrichten kann.
+- Web-Panel in hbbs auf Port 21114: Anmelden über Eider, Geräteliste mit Status (Aktiv, AFK, Offline), Besitzer und Gruppe, eigenes und geteilte Adressbücher, die Seite „Protokoll“ und für Admins die Seite „Benutzer“. Abschalten mit `PANEL=N`.
+- API für den Client auf demselben Port: Anmelden über Eider im Browser, eigenes und geteilte Adressbücher mit Einträgen und Tags, Status der Geräte (`POST /api/simpledesk/peer-status`). Heartbeat, Systeminfo und Protokoll-Einträge der Geräte werden gespeichert. `GET /api/simpledesk/server-info` nennt ohne Anmeldung den Key des Servers (wie in `id_ed25519.pub`), damit der Client sich beim ersten Start selbst einrichten kann.
+- Der Client fragt den Online-Status über WebSocket ab (`/ws/id`), hbbs antwortet dort. Vorher war mit WebSocket jedes Gerät „Offline“.
 - Neuer Schalter `LOGIN_REQUIRED=Y` (im Docker-Image Standard): Verbinden darf nur, wer im Client angemeldet ist und das Gerät steuern darf (siehe unten). Der Server prüft den Token, den der Client mit jeder Verbindungsanfrage schickt. Ohne Anmeldung sieht man „Bitte melde dich in SimpleDesk an“, ohne Recht „Du darfst dieses Gerät nicht steuern.“ Das gilt auch für den normalen RustDesk-Client. Geräte, auf die man zugreift, brauchen keine Anmeldung.
 
 ## Anmeldung über Eider oder einen anderen OIDC-Anbieter
@@ -60,6 +61,58 @@ Im Panel unter „Adressbuch“ legt jeder geteilte Adressbücher an und teilt s
 - **voll:** zusätzlich teilen, umbenennen und löschen
 
 Wer ein Adressbuch anlegt, und alle Admins haben „voll“. Der Client zeigt die geteilten Adressbücher neben dem eigenen. Passwörter, die jemand in einem geteilten Adressbuch speichert, sehen alle, mit denen es geteilt ist. Das eigene Adressbuch sieht nur man selbst, auch kein Admin.
+
+## Status der Geräte: Aktiv, AFK, Offline
+
+| Variable | Bedeutung |
+|---|---|
+| `AFK_MINUTES` | So viele Minuten ohne Tastatur oder Maus, dann gilt ein Gerät als AFK. Standard `5`. |
+
+- **Online (Aktiv):** Das Gerät ist mit dem Server verbunden, und jemand hat vor Kurzem getippt oder die Maus bewegt.
+- **AFK (seit X min):** online, aber seit `AFK_MINUTES` keine Eingabe. Die Zeit der letzten Eingabe schickt der Client im Heartbeat (`simpledesk_idle_secs`). Ältere Clients schicken sie nicht, die sind immer „Aktiv“.
+- **Offline (seit X):** nicht mit dem Server verbunden. „Seit“ ist, wann der Server das Gerät zuletzt gesehen hat. Das bleibt auch nach einem Neustart von hbbs erhalten.
+
+Das Panel zeigt den Status in der Geräteliste. Der Client fragt ihn so ab:
+
+```
+POST /api/simpledesk/peer-status
+Authorization: Bearer <Token>
+{"ids": ["Rathaus-PC", "Lager-PC"]}
+```
+
+Antwort: `{"Rathaus-PC": {"state": "afk", "since": 1763025600}}`. `state` ist `active`, `afk` oder `offline`, `since` sind Unix-Sekunden: bei `afk` die letzte Eingabe, bei `offline` wann das Gerät zuletzt gesehen wurde (`0` = nie), bei `active` die letzte Eingabe oder jetzt. In der Antwort stehen nur Geräte, die der Benutzer sehen darf, höchstens 1000 auf einmal.
+
+## Protokoll
+
+| Variable | Bedeutung |
+|---|---|
+| `AUDIT_DAYS` | So viele Tage bleiben Einträge im Protokoll. Standard `180`. |
+
+Die Seite „Protokoll“ im Panel zeigt:
+
+- **Verbindungen:** wer (angemeldeter Benutzer), von welchem Gerät und welcher IP, zu welchem Gerät, wann, wie lange und welche Art (Fernsteuerung, Dateiübertragung, Terminal, …). Verbindungen, die nicht zustande kamen (zum Beispiel falsches Passwort), stehen auch drin.
+- **Dateien**, die vom Gerät geholt oder auf das Gerät kopiert wurden, mit Ordner und den größten Dateien.
+- **Alarme** der Geräte, zum Beispiel „6 falsche Passwörter in einer Minute“.
+- **Änderungen im Panel:** ID vergeben oder ändern, Besitzer und Gruppe setzen, Benutzer abmelden, sperren und entsperren, Gruppen und Mitglieder, Adressbücher teilen.
+
+Admins sehen alles. Benutzer sehen, was auf ihren Geräten und den Geräten ihrer Gruppen passiert ist, und was sie selbst geändert haben. Filtern geht nach Gerät, Benutzer und Datum. Die Seite zeigt höchstens die neuesten 500 Einträge.
+
+Die Einträge schickt das Gerät, auf das zugegriffen wird. Wer sich verbunden hat, weiß der Server aus der Verbindungsanfrage. Verbindet sich jemand direkt per IP, ohne den Server, steht beim Benutzer „–“.
+
+## Alarm-Mails (optional)
+
+| Variable | Bedeutung |
+|---|---|
+| `SMTP_HOST` | Mailserver, zum Beispiel `smtp.example.org`. Ohne ihn gehen keine Mails raus. |
+| `SMTP_PORT` | Standard `587` (STARTTLS). `465` heißt TLS von Anfang an. |
+| `SMTP_USER` | Benutzer am Mailserver, leer für keine Anmeldung |
+| `SMTP_PASSWORD` | Passwort am Mailserver. Es steht nie im Log. |
+| `SMTP_FROM` | Absender, zum Beispiel `SimpleDesk <simpledesk@example.org>`. Standard ist `SMTP_USER`. |
+| `ALARM_MAIL_TO` | Empfänger, mit Komma getrennt |
+
+- Eine kurze Mail kommt bei jedem Alarm eines Geräts, pro Gerät aber höchstens alle 10 Minuten. Im Protokoll steht jeder Alarm.
+- Mit `IDS_BY_ADMIN=Y` kommt eine Mail, wenn ein neues Gerät auf seine ID wartet.
+- Die Verbindung zum Mailserver ist immer verschlüsselt. Der Mailserver braucht ein Zertifikat, dem auch ein Browser vertraut.
 
 ## Betrieb nur über Port 443
 
