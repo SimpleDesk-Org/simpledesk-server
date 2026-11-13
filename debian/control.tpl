@@ -1,10 +1,10 @@
 Source: rustdesk-server
 Section: net
 Priority: optional
-Maintainer: open-trade <info@rustdesk.com>
+Maintainer: SimpleDesk <felixthedevgit@users.noreply.github.com>
 Build-Depends: debhelper (>= 10), pkg-config
 Standards-Version: 4.5.0
-Homepage: https://rustdesk.com/
+Homepage: https://github.com/SimpleDesk-Org/simpledesk-server
 
 Package: rustdesk-server-hbbs
 Architecture: {{ ARCH }}

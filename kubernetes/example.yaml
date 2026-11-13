@@ -17,7 +17,7 @@ spec:
       containers:
         # id Server (HBBS)
         - name: hbbs
-          image: rustdesk/rustdesk-server:latest
+          image: ghcr.io/simpledesk-org/simpledesk-server:latest
           env:
             - name: RELAY_HOST
               value: "rustdesk.yourdomain.tld"
@@ -35,7 +35,7 @@ spec:
 
         # Relay Server (HBBR)
         - name: hbbr
-          image: rustdesk/rustdesk-server:latest
+          image: ghcr.io/simpledesk-org/simpledesk-server:latest
           command: ["hbbr", "-k", "_"]
           volumeMounts:
             - mountPath: /root

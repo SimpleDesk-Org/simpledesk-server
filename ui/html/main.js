@@ -51,7 +51,7 @@ class View {
             } else {
                 if (now >= this.action_time) {
                     if (this.is_edit_mode) {
-                        this.content = `# https://github.com/rustdesk/rustdesk-server#env-variables
+                        this.content = `# https://github.com/SimpleDesk-Org/simpledesk-server/blob/simpledesk/docs/environment-variables.md
 RUST_LOG=info
 `;
                     }
