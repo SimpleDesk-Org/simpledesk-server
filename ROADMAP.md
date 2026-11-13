@@ -69,6 +69,17 @@ Gearbeitet wird jeweils auf dem Branch `simpledesk`.
 | OIDC (Eider) | fertig und live, einziger Weg zum Anmelden |
 | LDAP (AD) | offen |
 | SMTP für Mails | Alarm-Mails und „neues Gerät wartet“ fertig |
-| Web-Client selbst hosten | offen |
+| Web-Client selbst hosten | untersucht: nicht nur mit offenem Code möglich (siehe unten) |
 
 Das Web-Panel wird mit axum und askama gebaut (wie Eider) und läuft in hbbs.
+
+## Web-Client selbst hosten? (untersucht, nichts gebaut)
+
+**Ergebnis:** Nicht nur mit offenem Code (AGPL). Es fehlt der wichtigste Teil.
+
+- Im offenen Client-Repo steckt nur die Oberfläche des Web-Clients (Flutter/Dart in `flutter/lib/web/`). Die eigentliche Arbeit macht ein JavaScript-Teil, den die Oberfläche aufruft (`setByName`, `getByName`): Verbindung über WebSocket, Verschlüsselung, Bild entpacken. Ohne ihn läuft `flutter build web` nicht.
+- Diesen JavaScript-Teil gibt es nicht mehr als Quellcode. RustDesk hat ihn im Juni 2024 in „v1“ und „v2“ geteilt. v2 kam nie ins Repo, v1 wurde im Juli 2025 gelöscht (Commit `5faf0ad3`). Der Build von RustDesk hat fertige Dateien ohne Quellcode heruntergeladen (`web_deps.tar.gz`). Den neuen Web-Client gibt RustDesk nur fertig gebaut heraus, mit RustDesk Server Pro.
+- Offen ist nur der alte Stand v1 in der Git-Geschichte. Er ist von 2022 bis 2024, kann wenig und passt nicht mehr zum heutigen Client. Für SimpleDesk müsste man ihn auf den heutigen Stand bringen und Anmeldung über Eider und „nur WebSocket“ einbauen.
+- Fertige Dateien von RustDesk nehmen wir nicht: kein Quellcode, und nicht unser Code.
+
+Wenn wir den Web-Client wollen, ist das ein eigenes Projekt: den JavaScript-Teil aus v1 neu aufbauen. Der Server hätte schon alles, was er dafür braucht (`/ws/id`, `/ws/relay` und die API über Port 443).
