@@ -2,9 +2,19 @@
 {% block title %}Adressbuch{% endblock %}
 {% block nav %}{% include "panel/nav.html" %}{% endblock %}
 {% block content %}
+<nav class="tabs" aria-label="Adressbücher">
+  {% for link in books %}
+  <a href="{{ link.href }}"{% if link.current %} class="active" aria-current="page"{% endif %}>{{ link.name }}{% if !link.right.is_empty() %} <span class="badge quiet">{{ link.right }}</span>{% endif %}</a>
+  {% endfor %}
+</nav>
+
 <section class="card">
-  <h1>Mein Adressbuch</h1>
-  <p class="hint">Dieselben Einträge siehst du im SimpleDesk-Client, wenn du dich dort mit diesem Konto anmeldest.</p>
+  <h1>{% if book.personal %}Mein Adressbuch{% else %}{{ book.name }}{% endif %}</h1>
+  {% if book.personal %}
+  <p class="hint">Nur du siehst dieses Adressbuch. Dieselben Einträge siehst du im SimpleDesk-Client, wenn du dich dort mit diesem Konto anmeldest.</p>
+  {% else %}
+  <p class="hint">Geteiltes Adressbuch von {{ book.owner }}. Du darfst hier <b>{{ right }}</b>. Im Client findest du es in der Liste der Adressbücher.</p>
+  {% endif %}
   {% if !error.is_empty() %}<p class="error">{{ error }}</p>{% endif %}
   {% if entries.is_empty() %}
   <p class="empty">Noch keine Einträge.</p>
@@ -21,10 +31,13 @@
         <td>{{ entry.tags }}</td>
         <td>{{ entry.note }}</td>
         <td class="actions">
+          {% if can_write %}
           <form method="post" action="/ab/delete">
+            <input type="hidden" name="book" value="{{ book.guid }}">
             <input type="hidden" name="id" value="{{ entry.id }}">
             <button class="link danger" type="submit">Löschen</button>
           </form>
+          {% endif %}
         </td>
       </tr>
       {% endfor %}
@@ -33,8 +46,10 @@
   {% endif %}
 </section>
 
+{% if can_write %}
 <form class="card add" method="post" action="/ab/add">
   <h2>Eintrag hinzufügen oder ändern</h2>
+  <input type="hidden" name="book" value="{{ book.guid }}">
   <div class="grid">
     <label>ID
       <input name="id" placeholder="Felix-Home-PC" required>
@@ -50,5 +65,84 @@
     </label>
   </div>
   <button type="submit">Speichern</button>
+</form>
+{% endif %}
+
+{% if full %}
+<section class="card add">
+  <h2>Teilen</h2>
+  <p class="hint"><b>lesen</b>: ansehen und verbinden. <b>schreiben</b>: auch Einträge und Tags ändern. <b>voll</b>: auch teilen, umbenennen und löschen.
+  Passwörter, die jemand im Client hier speichert, sehen alle, mit denen das Adressbuch geteilt ist.</p>
+  {% if shares.is_empty() %}
+  <p class="empty">Noch mit niemandem geteilt.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr><th>Mit</th><th>Recht</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for share in shares %}
+      <tr>
+        <td class="id">{% if share.kind == "group" %}Gruppe {% endif %}{{ share.name }}</td>
+        <td>{{ share.right }}</td>
+        <td class="actions">
+          <form method="post" action="/ab/unshare">
+            <input type="hidden" name="book" value="{{ book.guid }}">
+            <input type="hidden" name="kind" value="{{ share.kind }}">
+            <input type="hidden" name="name" value="{{ share.name }}">
+            <button class="link danger" type="submit">Entfernen</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+  <form class="inline add" method="post" action="/ab/share">
+    <input type="hidden" name="book" value="{{ book.guid }}">
+    <label>Teilen mit
+      <select name="who" required>
+        {% if !groups.is_empty() %}
+        <optgroup label="Gruppen">
+          {% for group in groups %}<option value="group:{{ group }}">{{ group }}</option>{% endfor %}
+        </optgroup>
+        {% endif %}
+        <optgroup label="Benutzer">
+          {% for name in users %}<option value="user:{{ name }}">{{ name }}</option>{% endfor %}
+        </optgroup>
+      </select>
+    </label>
+    <label>Recht
+      <select name="rule">
+        <option value="1">lesen</option>
+        <option value="2">schreiben</option>
+        <option value="3">voll</option>
+      </select>
+    </label>
+    <button type="submit">Teilen</button>
+  </form>
+  <form class="inline add" method="post" action="/ab/rename">
+    <input type="hidden" name="book" value="{{ book.guid }}">
+    <label>Name
+      <input name="name" value="{{ book.name }}" required maxlength="100">
+    </label>
+    <button type="submit">Umbenennen</button>
+  </form>
+  <form class="add" method="post" action="/ab/remove" onsubmit="return confirm('Dieses Adressbuch mit allen Einträgen löschen? Das geht nicht rückgängig.')">
+    <input type="hidden" name="book" value="{{ book.guid }}">
+    <button class="link danger" type="submit">Adressbuch löschen</button>
+  </form>
+</section>
+{% endif %}
+
+<form class="card add" method="post" action="/ab/new">
+  <h2>Neues geteiltes Adressbuch</h2>
+  <p class="hint">Zum Beispiel für alle Server oder für ein Team. Danach teilst du es mit Benutzern oder Gruppen.</p>
+  <div class="inline">
+    <label>Name
+      <input name="name" placeholder="Server" required maxlength="100">
+    </label>
+    <button type="submit">Anlegen</button>
+  </div>
 </form>
 {% endblock %}

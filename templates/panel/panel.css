@@ -108,6 +108,8 @@ td.id { font-weight: 600; }
   th:nth-child(5), td:nth-child(5) { display: none; }
 }
 .table-wrap { overflow-x: auto; }
+button.link.danger { color: var(--error); }
+label select { display: block; margin-top: 6px; }
 select {
   padding: 6px 8px;
   font: inherit;
@@ -137,6 +139,17 @@ form.chip {
   border: 1px solid var(--line);
   border-radius: 10px;
 }
-form.inline { display: flex; align-items: flex-end; gap: 8px; flex-wrap: wrap; margin: 0; }
-form.inline label { margin: 0; }
+form.inline, div.inline { display: flex; align-items: flex-end; gap: 8px; flex-wrap: wrap; margin: 0; }
+form.inline label, div.inline label { margin: 0; }
+form.inline.add { margin-top: 16px; }
+.tabs { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 16px; }
+.tabs a {
+  padding: 6px 12px;
+  color: var(--muted);
+  text-decoration: none;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.tabs a.active { color: var(--text); font-weight: 600; border-color: var(--accent); }
 td.actions form + form { margin-top: 4px; }

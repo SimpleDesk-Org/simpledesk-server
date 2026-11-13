@@ -7,7 +7,8 @@
 
 use crate::common::get_arg;
 use crate::oidc::{Oidc, OidcConfig, Purpose};
-use crate::database::DeviceRow;
+use crate::api::{RULE_FULL, RULE_READ, RULE_WRITE};
+use crate::database::{AbRow, DeviceRow};
 use crate::peer::PeerMap;
 use crate::rendezvous_server::{TcpPeers, REG_TIMEOUT};
 use askama::Template;
@@ -115,10 +116,19 @@ impl Panel {
         Ok(token)
     }
 
-    async fn ab_entries(&self, user: &str) -> ResultType<Vec<AbEntry>> {
-        let guid = self.pm.db.personal_ab(user).await?;
+    /// The address book of a page or form (`book` is its guid, empty for the personal book)
+    /// with the rule `user` has on it; None if the user may not read it.
+    async fn book_of(&self, user: &str, book: &str) -> ResultType<Option<(AbRow, i64)>> {
+        let guid = match book.trim() {
+            "" => self.pm.db.personal_ab(user).await?,
+            guid => guid.to_owned(),
+        };
+        crate::api::ab_access(&self.pm, user, &guid).await
+    }
+
+    async fn ab_entries(&self, guid: &str) -> ResultType<Vec<AbEntry>> {
         let mut entries = Vec::new();
-        for data in self.pm.db.list_ab_peers(&guid).await? {
+        for data in self.pm.db.list_ab_peers(guid).await? {
             let Ok(serde_json::Value::Object(peer)) = serde_json::from_str(&data) else {
                 continue;
             };
@@ -344,18 +354,54 @@ pub(crate) struct AbEntry {
     pub(crate) note: String,
 }
 
+/// A link to one of the books on the address book page.
+pub(crate) struct BookLink {
+    pub(crate) href: String,
+    pub(crate) name: String,
+    /// "lesen", "schreiben" or "voll" for shared books, '' for the personal book.
+    pub(crate) right: String,
+    pub(crate) current: bool,
+}
+
+/// Who a shared book is shared with.
+pub(crate) struct ShareView {
+    /// "user" or "group".
+    pub(crate) kind: String,
+    pub(crate) name: String,
+    pub(crate) right: &'static str,
+}
+
 #[derive(Template)]
 #[template(path = "panel/ab.html")]
 struct AbPage<'a> {
     user: &'a str,
     admin: bool,
     active: &'a str,
+    books: &'a [BookLink],
+    book: &'a AbRow,
+    /// What the user may do here: "lesen", "schreiben" or "voll".
+    right: &'a str,
+    can_write: bool,
+    /// Shared and with full control: share, rename and delete.
+    full: bool,
     entries: &'a [AbEntry],
+    shares: &'a [ShareView],
+    /// For sharing: all groups and users.
+    groups: &'a [String],
+    users: &'a [String],
     error: &'a str,
 }
 
 #[derive(Deserialize)]
+struct BookQuery {
+    #[serde(default)]
+    book: String,
+}
+
+#[derive(Deserialize)]
 struct AbAddForm {
+    #[serde(default)]
+    book: String,
     id: String,
     #[serde(default)]
     alias: String,
@@ -367,7 +413,64 @@ struct AbAddForm {
 
 #[derive(Deserialize)]
 struct AbDeleteForm {
+    #[serde(default)]
+    book: String,
     id: String,
+}
+
+#[derive(Deserialize)]
+struct BookForm {
+    #[serde(default)]
+    book: String,
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct ShareForm {
+    book: String,
+    /// "user:<name>" or "group:<name>".
+    who: String,
+    rule: i64,
+}
+
+#[derive(Deserialize)]
+struct UnshareForm {
+    book: String,
+    kind: String,
+    name: String,
+}
+
+/// Names the client already uses for its own books; a shared book with such a name would get
+/// mixed up with them.
+const RESERVED_BOOK_NAMES: [&str; 3] = ["My address book", "Legacy address book", "Mein Adressbuch"];
+
+fn right_label(rule: i64) -> &'static str {
+    match rule {
+        RULE_READ => "lesen",
+        RULE_WRITE => "schreiben",
+        _ => "voll",
+    }
+}
+
+fn book_href(book: &AbRow) -> String {
+    if book.personal {
+        "/ab".to_owned()
+    } else {
+        format!("/ab?book={}", book.guid)
+    }
+}
+
+/// A usable name for a shared book.
+fn book_name(name: &str) -> Result<&str, &'static str> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 100 {
+        return Err("Bitte einen Namen für das Adressbuch eingeben (höchstens 100 Zeichen).");
+    }
+    if RESERVED_BOOK_NAMES.iter().any(|reserved| reserved.eq_ignore_ascii_case(name)) {
+        return Err("So heißt schon das eigene Adressbuch. Bitte einen anderen Namen wählen.");
+    }
+    Ok(name)
 }
 
 /// Starts the panel unless PANEL=N. Errors are logged; the rest of hbbs keeps running.
@@ -409,6 +512,11 @@ pub(crate) fn router(panel: Arc<Panel>) -> Router {
         .route("/ab", get(ab_page))
         .route("/ab/add", post(ab_add))
         .route("/ab/delete", post(ab_delete))
+        .route("/ab/new", post(ab_new))
+        .route("/ab/share", post(ab_share))
+        .route("/ab/unshare", post(ab_unshare))
+        .route("/ab/rename", post(ab_rename))
+        .route("/ab/remove", post(ab_remove))
         .route("/devices/assign", post(devices_assign))
         .route("/users", get(users_page))
         .route("/users/signout", post(users_signout))
@@ -735,19 +843,72 @@ async fn groups_leave(
     users_done(&panel, &admin, result).await
 }
 
-async fn render_ab(panel: &Panel, user: &str, status: StatusCode, error: &str) -> Response {
-    match panel.ab_entries(user).await {
-        Ok(entries) => html(
-            status,
-            AbPage {
-                user,
-                admin: panel.pm.accounts.is_admin(user),
-                active: "ab",
-                entries: &entries,
-                error,
-            }
-            .render(),
-        ),
+fn book_not_found() -> Response {
+    let page = Html("<p>Dieses Adressbuch gibt es nicht, oder du darfst es nicht sehen. <a href=\"/ab\">Zu deinem Adressbuch</a></p>");
+    (StatusCode::NOT_FOUND, page).into_response()
+}
+
+/// The address book page for `book` (its guid, empty for the personal book).
+async fn render_ab(panel: &Panel, user: &str, book: &str, status: StatusCode, error: &str) -> Response {
+    let result: ResultType<Option<Response>> = async {
+        let Some((current, rule)) = panel.book_of(user, book).await? else {
+            return Ok(None);
+        };
+        let db = &panel.pm.db;
+        let personal = db.personal_ab(user).await?;
+        let mut books = vec![BookLink {
+            href: "/ab".to_owned(),
+            name: "Mein Adressbuch".to_owned(),
+            right: String::new(),
+            current: current.guid == personal,
+        }];
+        for (shared, rule) in crate::api::shared_abs(&panel.pm, user).await? {
+            books.push(BookLink {
+                href: book_href(&shared),
+                current: shared.guid == current.guid,
+                name: shared.name,
+                right: right_label(rule).to_owned(),
+            });
+        }
+        let entries = panel.ab_entries(&current.guid).await?;
+        let full = !current.personal && rule >= RULE_FULL;
+        let (shares, groups, users) = if full {
+            let shares: Vec<ShareView> = db
+                .ab_rules(&current.guid)
+                .await?
+                .into_iter()
+                .map(|(kind, name, rule)| ShareView {
+                    kind,
+                    name,
+                    right: right_label(rule),
+                })
+                .collect();
+            let users: Vec<String> = db.list_users().await?.into_iter().map(|row| row.name).collect();
+            (shares, db.list_groups().await?, users)
+        } else {
+            Default::default()
+        };
+        let page = AbPage {
+            user,
+            admin: panel.pm.accounts.is_admin(user),
+            active: "ab",
+            books: &books,
+            book: &current,
+            right: right_label(rule),
+            can_write: rule >= RULE_WRITE,
+            full,
+            entries: &entries,
+            shares: &shares,
+            groups: &groups,
+            users: &users,
+            error,
+        };
+        Ok(Some(html(status, page.render())))
+    }
+    .await;
+    match result {
+        Ok(Some(res)) => res,
+        Ok(None) => book_not_found(),
         Err(err) => {
             log::error!("SimpleDesk web panel: reading the address book failed: {}", err);
             (StatusCode::INTERNAL_SERVER_ERROR, "Adressbuch konnte nicht gelesen werden.")
@@ -756,15 +917,56 @@ async fn render_ab(panel: &Panel, user: &str, status: StatusCode, error: &str) -
     }
 }
 
-async fn ab_page(Extension(panel): Extension<Arc<Panel>>, headers: HeaderMap) -> Response {
+async fn ab_page(
+    Extension(panel): Extension<Arc<Panel>>,
+    headers: HeaderMap,
+    Query(query): Query<BookQuery>,
+) -> Response {
     let Some(user) = panel.user(&headers).await else {
         return redirect("/login", None);
     };
-    render_ab(&panel, &user, StatusCode::OK, "").await
+    render_ab(&panel, &user, &query.book, StatusCode::OK, "").await
 }
 
-/// Adds an entry to the personal address book or changes alias, tags and note of an
-/// existing one. Other fields the client stored (hash, username, ...) are kept.
+/// The book of a form if `user` has at least rule `needed` on it, else the answer to send.
+async fn book_for(panel: &Panel, user: &str, book: &str, needed: i64) -> Result<AbRow, Response> {
+    match panel.book_of(user, book).await {
+        Ok(Some((ab, rule))) if rule >= needed && (needed < RULE_FULL || !ab.personal) => Ok(ab),
+        Ok(Some(_)) => {
+            let error = if needed >= RULE_FULL {
+                "Teilen, umbenennen und löschen darf nur, wer volle Rechte hat."
+            } else {
+                "Du darfst dieses Adressbuch nur lesen."
+            };
+            Err(render_ab(panel, user, book, StatusCode::FORBIDDEN, error).await)
+        }
+        Ok(None) => Err(book_not_found()),
+        Err(err) => {
+            log::error!("SimpleDesk web panel: reading the address book failed: {}", err);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "Adressbuch konnte nicht gelesen werden.").into_response())
+        }
+    }
+}
+
+/// The end of a change of a book: back to its page, or the page with the error.
+async fn book_done(
+    panel: &Panel,
+    user: &str,
+    book: &AbRow,
+    result: ResultType<Result<(), &str>>,
+) -> Response {
+    match result {
+        Ok(Ok(())) => redirect_to(&book_href(book), None),
+        Ok(Err(error)) => render_ab(panel, user, &book.guid, StatusCode::BAD_REQUEST, error).await,
+        Err(err) => {
+            log::error!("SimpleDesk web panel: changing the address book failed: {}", err);
+            render_ab(panel, user, &book.guid, StatusCode::INTERNAL_SERVER_ERROR, "Speichern hat nicht geklappt.").await
+        }
+    }
+}
+
+/// Adds an entry to an address book or changes alias, tags and note of an existing one.
+/// Other fields the client stored (hash, password, username, ...) are kept.
 async fn ab_add(
     Extension(panel): Extension<Arc<Panel>>,
     headers: HeaderMap,
@@ -773,10 +975,14 @@ async fn ab_add(
     let Some(user) = panel.user(&headers).await else {
         return redirect("/login", None);
     };
+    let book = match book_for(&panel, &user, &form.book, RULE_WRITE).await {
+        Ok(book) => book,
+        Err(res) => return res,
+    };
     let id = form.id.trim();
     if id.is_empty() || id.len() > MAX_ID_LEN || id.contains(char::is_whitespace) {
         let error = "Bitte eine gültige ID eingeben (ohne Leerzeichen).";
-        return render_ab(&panel, &user, StatusCode::BAD_REQUEST, error).await;
+        return render_ab(&panel, &user, &book.guid, StatusCode::BAD_REQUEST, error).await;
     }
     let tags: Vec<String> = form
         .tags
@@ -787,8 +993,8 @@ async fn ab_add(
         .collect();
     let result: ResultType<()> = async {
         let db = &panel.pm.db;
-        let guid = db.personal_ab(&user).await?;
-        let mut peer = match db.get_ab_peer(&guid, id).await? {
+        let guid = &book.guid;
+        let mut peer = match db.get_ab_peer(guid, id).await? {
             Some(data) => match serde_json::from_str(&data) {
                 Ok(serde_json::Value::Object(peer)) => peer,
                 _ => serde_json::Map::new(),
@@ -799,25 +1005,21 @@ async fn ab_add(
         peer.insert("alias".to_owned(), form.alias.trim().into());
         peer.insert("tags".to_owned(), tags.clone().into());
         peer.insert("note".to_owned(), form.note.trim().into());
-        db.upsert_ab_peer(&guid, id, &serde_json::Value::Object(peer).to_string())
+        db.upsert_ab_peer(guid, id, &serde_json::Value::Object(peer).to_string())
             .await?;
         let known: Vec<String> = db
-            .list_ab_tags(&guid)
+            .list_ab_tags(guid)
             .await?
             .into_iter()
             .map(|(name, _)| name)
             .collect();
         for tag in tags.iter().filter(|tag| !known.contains(tag)) {
-            db.upsert_ab_tag(&guid, tag, DEFAULT_TAG_COLOR).await?;
+            db.upsert_ab_tag(guid, tag, DEFAULT_TAG_COLOR).await?;
         }
         Ok(())
     }
     .await;
-    if let Err(err) = result {
-        log::error!("SimpleDesk web panel: saving the entry failed: {}", err);
-        return render_ab(&panel, &user, StatusCode::INTERNAL_SERVER_ERROR, "Speichern hat nicht geklappt.").await;
-    }
-    redirect("/ab", None)
+    book_done(&panel, &user, &book, result.map(Ok)).await
 }
 
 async fn ab_delete(
@@ -828,15 +1030,154 @@ async fn ab_delete(
     let Some(user) = panel.user(&headers).await else {
         return redirect("/login", None);
     };
-    let result: ResultType<()> = async {
-        let guid = panel.pm.db.personal_ab(&user).await?;
-        panel.pm.db.delete_ab_peer(&guid, form.id.trim()).await
+    let book = match book_for(&panel, &user, &form.book, RULE_WRITE).await {
+        Ok(book) => book,
+        Err(res) => return res,
+    };
+    let result = panel.pm.db.delete_ab_peer(&book.guid, form.id.trim()).await;
+    book_done(&panel, &user, &book, result.map(Ok)).await
+}
+
+/// A new shared book; the user who creates it owns it.
+async fn ab_new(
+    Extension(panel): Extension<Arc<Panel>>,
+    headers: HeaderMap,
+    Form(form): Form<BookForm>,
+) -> Response {
+    let Some(user) = panel.user(&headers).await else {
+        return redirect("/login", None);
+    };
+    let name = match book_name(&form.name) {
+        Ok(name) => name,
+        Err(error) => return render_ab(&panel, &user, "", StatusCode::BAD_REQUEST, error).await,
+    };
+    match panel.pm.db.create_shared_ab(&user, name).await {
+        Ok(Some(guid)) => {
+            log::info!("SimpleDesk web panel: {} created the shared address book {}", user, name);
+            redirect_to(&format!("/ab?book={}", guid), None)
+        }
+        Ok(None) => {
+            let error = "Ein geteiltes Adressbuch mit diesem Namen gibt es schon.";
+            render_ab(&panel, &user, "", StatusCode::BAD_REQUEST, error).await
+        }
+        Err(err) => {
+            log::error!("SimpleDesk web panel: creating an address book failed: {}", err);
+            render_ab(&panel, &user, "", StatusCode::INTERNAL_SERVER_ERROR, "Speichern hat nicht geklappt.").await
+        }
+    }
+}
+
+/// Shares a book with a user or a group, or changes the rule of an existing share.
+async fn ab_share(
+    Extension(panel): Extension<Arc<Panel>>,
+    headers: HeaderMap,
+    Form(form): Form<ShareForm>,
+) -> Response {
+    let Some(user) = panel.user(&headers).await else {
+        return redirect("/login", None);
+    };
+    let book = match book_for(&panel, &user, &form.book, RULE_FULL).await {
+        Ok(book) => book,
+        Err(res) => return res,
+    };
+    let result: ResultType<Result<(), &str>> = async {
+        let db = &panel.pm.db;
+        if !(RULE_READ..=RULE_FULL).contains(&form.rule) {
+            return Ok(Err("Bitte lesen, schreiben oder voll wählen."));
+        }
+        let (kind, name) = match form.who.split_once(':') {
+            Some(("user", name)) => {
+                if !db.user_exists(name).await? {
+                    return Ok(Err("Diesen Benutzer gibt es nicht."));
+                }
+                ("user", name.to_owned())
+            }
+            Some(("group", name)) => match db.group_name(name).await? {
+                Some(group) => ("group", group),
+                None => return Ok(Err("Diese Gruppe gibt es nicht.")),
+            },
+            _ => return Ok(Err("Bitte einen Benutzer oder eine Gruppe wählen.")),
+        };
+        db.set_ab_rule(&book.guid, kind, &name, form.rule).await?;
+        log::info!(
+            "SimpleDesk web panel: {} shared the address book {} with {} {} ({})",
+            user,
+            book.name,
+            kind,
+            name,
+            right_label(form.rule)
+        );
+        Ok(Ok(()))
     }
     .await;
-    if let Err(err) = result {
-        log::error!("SimpleDesk web panel: deleting the entry failed: {}", err);
+    book_done(&panel, &user, &book, result).await
+}
+
+async fn ab_unshare(
+    Extension(panel): Extension<Arc<Panel>>,
+    headers: HeaderMap,
+    Form(form): Form<UnshareForm>,
+) -> Response {
+    let Some(user) = panel.user(&headers).await else {
+        return redirect("/login", None);
+    };
+    let book = match book_for(&panel, &user, &form.book, RULE_FULL).await {
+        Ok(book) => book,
+        Err(res) => return res,
+    };
+    let result = panel.pm.db.delete_ab_rule(&book.guid, &form.kind, &form.name).await;
+    book_done(&panel, &user, &book, result.map(Ok)).await
+}
+
+async fn ab_rename(
+    Extension(panel): Extension<Arc<Panel>>,
+    headers: HeaderMap,
+    Form(form): Form<BookForm>,
+) -> Response {
+    let Some(user) = panel.user(&headers).await else {
+        return redirect("/login", None);
+    };
+    let book = match book_for(&panel, &user, &form.book, RULE_FULL).await {
+        Ok(book) => book,
+        Err(res) => return res,
+    };
+    let result: ResultType<Result<(), &str>> = async {
+        let name = match book_name(&form.name) {
+            Ok(name) => name,
+            Err(error) => return Ok(Err(error)),
+        };
+        if !panel.pm.db.rename_shared_ab(&book.guid, name).await? {
+            return Ok(Err("Ein geteiltes Adressbuch mit diesem Namen gibt es schon."));
+        }
+        Ok(Ok(()))
     }
-    redirect("/ab", None)
+    .await;
+    book_done(&panel, &user, &book, result).await
+}
+
+/// Deletes a shared book with all its entries.
+async fn ab_remove(
+    Extension(panel): Extension<Arc<Panel>>,
+    headers: HeaderMap,
+    Form(form): Form<BookForm>,
+) -> Response {
+    let Some(user) = panel.user(&headers).await else {
+        return redirect("/login", None);
+    };
+    let book = match book_for(&panel, &user, &form.book, RULE_FULL).await {
+        Ok(book) => book,
+        Err(res) => return res,
+    };
+    match panel.pm.db.delete_shared_ab(&book.guid).await {
+        Ok(()) => {
+            log::info!("SimpleDesk web panel: {} deleted the shared address book {}", user, book.name);
+            redirect("/ab", None)
+        }
+        Err(err) => {
+            log::error!("SimpleDesk web panel: deleting an address book failed: {}", err);
+            render_ab(&panel, &user, &book.guid, StatusCode::INTERNAL_SERVER_ERROR, "Löschen hat nicht geklappt.").await
+        }
+    }
 }
 
 async fn login_page(Extension(panel): Extension<Arc<Panel>>, headers: HeaderMap) -> Response {
@@ -1259,6 +1600,85 @@ mod tests {
         send(&panel, post_form_with("/groups/delete", "name=Lager", &felix)).await;
         assert!(sees(ben.clone()).await.is_empty());
         assert_eq!(db.device_owner("Lager-PC").await.unwrap(), Some((String::new(), String::new())));
+    }
+
+    #[hbb_common::tokio::test]
+    async fn shared_books_are_created_and_shared_in_the_panel() {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = test_panel(&dir).await;
+        let db = &panel.pm.db;
+        let anna = signed_in(&panel, "anna").await;
+        let ben = signed_in(&panel, "ben").await;
+        let carl = signed_in(&panel, "carl").await;
+        assert!(db.create_group("Team").await.unwrap());
+        db.add_group_member("Team", "ben").await.unwrap();
+
+        // anna creates a book and lands on its page, where she can share it.
+        let res = send(&panel, post_form_with("/ab/new", "name=Server", &anna)).await;
+        let page_path = location(&res).to_owned();
+        assert!(page_path.starts_with("/ab?book="), "{page_path}");
+        let guid = page_path.trim_start_matches("/ab?book=").to_owned();
+        let page = body(send(&panel, get(&page_path, Some(&anna))).await).await;
+        assert!(page.contains("<h1>Server</h1>") && page.contains("Teilen mit"), "{page}");
+        assert!(page.contains("value=\"group:Team\"") && page.contains("value=\"user:ben\""), "{page}");
+        for name in ["server", "Mein Adressbuch", "my address book", ""] {
+            let res = send(&panel, post_form_with("/ab/new", &format!("name={name}"), &anna)).await;
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{name}");
+        }
+
+        // Shared with the group Team to write.
+        let form = format!("book={guid}&who=group%3ATeam&rule=2");
+        assert_eq!(location(&send(&panel, post_form_with("/ab/share", &form, &anna)).await), page_path);
+        assert_eq!(db.ab_rules(&guid).await.unwrap(), vec![("group".to_owned(), "Team".to_owned(), 2)]);
+        let res = send(&panel, post_form_with("/ab/share", &format!("book={guid}&who=user%3Aniemand&rule=1"), &anna)).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // ben sees it among his books, may add entries but not share.
+        let page = body(send(&panel, get("/ab", Some(&ben))).await).await;
+        assert!(page.contains(&format!("href=\"{page_path}\"")) && page.contains("schreiben"), "{page}");
+        let page = body(send(&panel, get(&page_path, Some(&ben))).await).await;
+        assert!(page.contains("Eintrag hinzufügen") && !page.contains("Teilen mit"), "{page}");
+        let form = format!("book={guid}&id=Server-1&alias=Erster&tags=Linux&note=");
+        assert_eq!(location(&send(&panel, post_form_with("/ab/add", &form, &ben)).await), page_path);
+        assert_eq!(db.list_ab_peers(&guid).await.unwrap().len(), 1);
+        assert!(db.list_ab_peers(&db.personal_ab("ben").await.unwrap()).await.unwrap().is_empty());
+        let res = send(&panel, post_form_with("/ab/share", &format!("book={guid}&who=user%3Acarl&rule=3"), &ben)).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // carl has no share: no page, no changes.
+        assert_eq!(send(&panel, get(&page_path, Some(&carl))).await.status(), StatusCode::NOT_FOUND);
+        let res = send(&panel, post_form_with("/ab/delete", &format!("book={guid}&id=Server-1"), &carl)).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert!(!body(send(&panel, get("/ab", Some(&carl))).await).await.contains(&page_path));
+
+        // Read only: the page shows the entries, without forms to change them.
+        send(&panel, post_form_with("/ab/share", &format!("book={guid}&who=user%3Acarl&rule=1"), &anna)).await;
+        let page = body(send(&panel, get(&page_path, Some(&carl))).await).await;
+        assert!(page.contains("Server-1") && !page.contains("Eintrag hinzufügen"), "{page}");
+        let res = send(&panel, post_form_with("/ab/add", &format!("book={guid}&id=Neu"), &carl)).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // Rename, unshare, delete.
+        let res = send(&panel, post_form_with("/ab/rename", &format!("book={guid}&name=Server+Amt"), &anna)).await;
+        assert_eq!(location(&res), page_path);
+        assert!(body(send(&panel, get(&page_path, Some(&ben))).await).await.contains("Server Amt"));
+        send(&panel, post_form_with("/ab/unshare", &format!("book={guid}&kind=group&name=Team"), &anna)).await;
+        assert_eq!(send(&panel, get(&page_path, Some(&ben))).await.status(), StatusCode::NOT_FOUND);
+        let res = send(&panel, post_form_with("/ab/remove", &format!("book={guid}"), &anna)).await;
+        assert_eq!(location(&res), "/ab");
+        assert_eq!(db.get_ab(&guid).await.unwrap(), None);
+        assert!(db.list_ab_peers(&guid).await.unwrap().is_empty());
+
+        // Admins manage every shared book, but the personal books stay private.
+        let felix = signed_in(&panel, "felix").await;
+        let res = send(&panel, post_form_with("/ab/new", "name=Drucker", &carl)).await;
+        let carls = location(&res).to_owned();
+        assert!(body(send(&panel, get(&carls, Some(&felix))).await).await.contains("Teilen mit"));
+        let personal = db.personal_ab("carl").await.unwrap();
+        let res = send(&panel, get(&format!("/ab?book={personal}"), Some(&felix))).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let res = send(&panel, post_form_with("/ab/remove", &format!("book={personal}"), &carl)).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 
     #[hbb_common::tokio::test]

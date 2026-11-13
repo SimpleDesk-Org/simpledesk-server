@@ -1,9 +1,10 @@
-//! SimpleDesk: the HTTP API the client uses for its account and address book.
+//! SimpleDesk: the HTTP API the client uses for its account and address books.
 //!
 //! Built from the open client source (flutter/lib/models/user_model.dart, ab_model.dart and
 //! src/hbbs_http/), not from any closed server. Errors are `{"error": "..."}`; address book
 //! actions answer 200 with an empty body, because the client treats any body as an error.
 
+use crate::database::AbRow;
 use crate::oidc::ClientLoginState;
 use crate::panel::{hex, Panel};
 use crate::peer::PeerMap;
@@ -303,8 +304,7 @@ async fn address_book(
     let result = match (method.as_str(), segments.as_slice()) {
         ("POST", ["settings"]) => Ok(Json(json!({ "max_peer_one_ab": 0 })).into_response()),
         ("POST", ["personal"]) => personal(&panel, &user).await,
-        // Shared address books come later.
-        ("POST", ["shared", "profiles"]) => Ok(empty_page().await),
+        ("POST", ["shared", "profiles"]) => shared_profiles(&panel, &user, &query).await,
         ("POST", ["peers"]) => {
             let guid = query.get("ab").map(String::as_str).unwrap_or_default();
             peers(&panel, &user, guid, &query).await
@@ -336,22 +336,63 @@ fn bad_request(msg: &str) -> Response {
     api_error(StatusCode::BAD_REQUEST, msg)
 }
 
-/// Only the owner may use an address book.
-async fn check_owner(panel: &Panel, user: &str, guid: &str) -> Result<(), Response> {
-    match panel.pm.db.ab_owner(guid).await.map_err(db_error)? {
-        Some(owner) if owner == user => Ok(()),
-        _ => Err(api_error(StatusCode::NOT_FOUND, "Adressbuch nicht gefunden.")),
+/// Rules of a shared address book, as ShareRule in the client.
+pub(crate) const RULE_READ: i64 = 1;
+pub(crate) const RULE_WRITE: i64 = 2;
+pub(crate) const RULE_FULL: i64 = 3;
+
+/// The shared books `user` may read, with the rule on each: full control for the owner and
+/// for admins, else the best rule a share for the user or one of the user's groups gives.
+pub(crate) async fn shared_abs(pm: &PeerMap, user: &str) -> ResultType<Vec<(AbRow, i64)>> {
+    let admin = pm.accounts.is_admin(user);
+    Ok(pm
+        .db
+        .shared_abs_for(user)
+        .await?
+        .into_iter()
+        .filter_map(|(ab, rule)| {
+            let rule = if admin || ab.owner == user {
+                RULE_FULL
+            } else {
+                rule.min(RULE_FULL)
+            };
+            (rule >= RULE_READ).then(|| (ab, rule))
+        })
+        .collect())
+}
+
+/// An address book with the rule `user` has on it; None if the user may not even read it.
+/// A personal book is for its owner only, also not for admins.
+pub(crate) async fn ab_access(pm: &PeerMap, user: &str, guid: &str) -> ResultType<Option<(AbRow, i64)>> {
+    let Some(ab) = pm.db.get_ab(guid).await? else {
+        return Ok(None);
+    };
+    if ab.personal {
+        return Ok((ab.owner == user).then(|| (ab, RULE_FULL)));
+    }
+    Ok(shared_abs(pm, user)
+        .await?
+        .into_iter()
+        .find(|(shared, _)| shared.guid == ab.guid))
+}
+
+/// The address book if `user` has at least rule `needed` on it.
+async fn check_access(panel: &Panel, user: &str, guid: &str, needed: i64) -> Result<AbRow, Response> {
+    match ab_access(&panel.pm, user, guid).await.map_err(db_error)? {
+        Some((ab, rule)) if rule >= needed => Ok(ab),
+        Some(_) => Err(api_error(StatusCode::FORBIDDEN, "Du darfst dieses Adressbuch nur lesen.")),
+        None => Err(api_error(StatusCode::NOT_FOUND, "Adressbuch nicht gefunden.")),
     }
 }
 
-async fn personal(panel: &Panel, user: &str) -> AbResult {
-    let guid = panel.pm.db.personal_ab(user).await.map_err(db_error)?;
-    Ok(Json(json!({ "guid": guid })).into_response())
+/// The client keeps a password hash only in the personal book and a password only in shared
+/// books; the server keeps it that way too.
+fn clean_peer(peer: &mut Map<String, Value>, personal: bool) {
+    peer.remove(if personal { "password" } else { "hash" });
 }
 
-async fn peers(panel: &Panel, user: &str, guid: &str, query: &HashMap<String, String>) -> AbResult {
-    check_owner(panel, user, guid).await?;
-    let all = panel.pm.db.list_ab_peers(guid).await.map_err(db_error)?;
+/// The page of `all` that the query's current and pageSize ask for.
+fn page_of<'a, T>(all: &'a [T], query: &HashMap<String, String>) -> impl Iterator<Item = &'a T> {
     let current = query
         .get("current")
         .and_then(|value| value.parse::<usize>().ok())
@@ -362,17 +403,43 @@ async fn peers(panel: &Panel, user: &str, guid: &str, query: &HashMap<String, St
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(100)
         .clamp(1, MAX_PAGE_SIZE);
-    let data: Vec<Value> = all
-        .iter()
-        .skip((current - 1) * size)
-        .take(size)
+    all.iter().skip((current - 1).saturating_mul(size)).take(size)
+}
+
+async fn personal(panel: &Panel, user: &str) -> AbResult {
+    let guid = panel.pm.db.personal_ab(user).await.map_err(db_error)?;
+    Ok(Json(json!({ "guid": guid })).into_response())
+}
+
+/// The shared books the user may read, as the client's AbProfile.
+async fn shared_profiles(panel: &Panel, user: &str, query: &HashMap<String, String>) -> AbResult {
+    let books = shared_abs(&panel.pm, user).await.map_err(db_error)?;
+    let data: Vec<Value> = page_of(&books, query)
+        .map(|(ab, rule)| {
+            json!({
+                "guid": ab.guid,
+                "name": ab.name,
+                "owner": ab.owner,
+                "note": "",
+                "rule": rule,
+                "info": {},
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "total": books.len(), "data": data })).into_response())
+}
+
+async fn peers(panel: &Panel, user: &str, guid: &str, query: &HashMap<String, String>) -> AbResult {
+    check_access(panel, user, guid, RULE_READ).await?;
+    let all = panel.pm.db.list_ab_peers(guid).await.map_err(db_error)?;
+    let data: Vec<Value> = page_of(&all, query)
         .filter_map(|data| serde_json::from_str(data).ok())
         .collect();
     Ok(Json(json!({ "total": all.len(), "data": data })).into_response())
 }
 
 async fn tags(panel: &Panel, user: &str, guid: &str) -> AbResult {
-    check_owner(panel, user, guid).await?;
+    check_access(panel, user, guid, RULE_READ).await?;
     let tags: Vec<Value> = panel
         .pm
         .db
@@ -403,8 +470,9 @@ fn peer_object(body: &[u8]) -> Result<(String, Map<String, Value>), Response> {
 }
 
 async fn add_peer(panel: &Panel, user: &str, guid: &str, body: &[u8]) -> AbResult {
-    check_owner(panel, user, guid).await?;
+    let ab = check_access(panel, user, guid, RULE_WRITE).await?;
     let (id, mut peer) = peer_object(body)?;
+    clean_peer(&mut peer, ab.personal);
     peer.insert("id".to_owned(), Value::String(id.clone()));
     let data = Value::Object(peer).to_string();
     panel.pm.db.upsert_ab_peer(guid, &id, &data).await.map_err(db_error)?;
@@ -412,8 +480,9 @@ async fn add_peer(panel: &Panel, user: &str, guid: &str, body: &[u8]) -> AbResul
 }
 
 async fn update_peer(panel: &Panel, user: &str, guid: &str, body: &[u8]) -> AbResult {
-    check_owner(panel, user, guid).await?;
-    let (id, changes) = peer_object(body)?;
+    let ab = check_access(panel, user, guid, RULE_WRITE).await?;
+    let (id, mut changes) = peer_object(body)?;
+    clean_peer(&mut changes, ab.personal);
     let Some(existing) = panel.pm.db.get_ab_peer(guid, &id).await.map_err(db_error)? else {
         return Err(api_error(StatusCode::NOT_FOUND, "Eintrag nicht gefunden."));
     };
@@ -437,7 +506,7 @@ fn string_list(body: &[u8]) -> Result<Vec<String>, Response> {
 }
 
 async fn delete_peers(panel: &Panel, user: &str, guid: &str, body: &[u8]) -> AbResult {
-    check_owner(panel, user, guid).await?;
+    check_access(panel, user, guid, RULE_WRITE).await?;
     for id in string_list(body)? {
         panel.pm.db.delete_ab_peer(guid, &id).await.map_err(db_error)?;
     }
@@ -452,7 +521,7 @@ struct TagRequest {
 }
 
 async fn set_tag(panel: &Panel, user: &str, guid: &str, body: &[u8]) -> AbResult {
-    check_owner(panel, user, guid).await?;
+    check_access(panel, user, guid, RULE_WRITE).await?;
     let Ok(tag) = serde_json::from_slice::<TagRequest>(body) else {
         return Err(bad_request("Ungültiger Tag."));
     };
@@ -471,7 +540,7 @@ struct RenameRequest {
 }
 
 async fn rename_tag(panel: &Panel, user: &str, guid: &str, body: &[u8]) -> AbResult {
-    check_owner(panel, user, guid).await?;
+    check_access(panel, user, guid, RULE_WRITE).await?;
     let Ok(rename) = serde_json::from_slice::<RenameRequest>(body) else {
         return Err(bad_request("Ungültige Umbenennung."));
     };
@@ -499,7 +568,7 @@ async fn rename_tag(panel: &Panel, user: &str, guid: &str, body: &[u8]) -> AbRes
 }
 
 async fn delete_tags(panel: &Panel, user: &str, guid: &str, body: &[u8]) -> AbResult {
-    check_owner(panel, user, guid).await?;
+    check_access(panel, user, guid, RULE_WRITE).await?;
     let names = string_list(body)?;
     for name in &names {
         panel.pm.db.delete_ab_tag(guid, name).await.map_err(db_error)?;
@@ -705,6 +774,93 @@ mod tests {
         assert_eq!(super::token_user(&panel.pm, &fresh).await.as_deref(), Some("felix"));
         let hash = super::token_hash(&token);
         assert_eq!(panel.pm.db.get_api_token_user(&hash, 100_000).await.unwrap(), None);
+    }
+
+    #[hbb_common::tokio::test]
+    async fn shared_books_follow_their_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = crate::peer::test_peer_map(&dir).await;
+        pm.accounts = Arc::new(crate::accounts::Accounts::with_admins("felix"));
+        let panel = Arc::new(Panel::new(pm, Default::default()).await.unwrap());
+        let db = &panel.pm.db;
+        let [felix, anna, ben, carl, dora] = [
+            login(&panel, "felix").await,
+            login(&panel, "anna").await,
+            login(&panel, "ben").await,
+            login(&panel, "carl").await,
+            login(&panel, "dora").await,
+        ];
+        // anna owns "Server"; the group Team may write, carl may read, dora nothing.
+        let guid = db.create_shared_ab("anna", "Server").await.unwrap().unwrap();
+        assert_eq!(db.create_shared_ab("ben", "server").await.unwrap(), None);
+        assert!(db.create_group("Team").await.unwrap());
+        db.add_group_member("Team", "ben").await.unwrap();
+        db.set_ab_rule(&guid, "group", "Team", 2).await.unwrap();
+        db.set_ab_rule(&guid, "user", "carl", 1).await.unwrap();
+        // A weaker share for ben himself does not take the group's right away.
+        db.set_ab_rule(&guid, "user", "ben", 1).await.unwrap();
+
+        let profiles = |token: String| {
+            let panel = panel.clone();
+            async move {
+                let path = "/api/ab/shared/profiles?current=1&pageSize=100";
+                json_of(call(&panel, "POST", path, Some(&token), None).await).await
+            }
+        };
+        let page = profiles(anna.clone()).await;
+        assert_eq!(page["total"], 1);
+        assert_eq!(
+            page["data"][0],
+            json!({"guid": guid, "name": "Server", "owner": "anna", "note": "", "rule": 3, "info": {}})
+        );
+        for (token, rule) in [(&felix, 3), (&ben, 2), (&carl, 1)] {
+            assert_eq!(profiles(token.clone()).await["data"][0]["rule"], rule);
+        }
+        assert_eq!(profiles(dora.clone()).await, json!({"total": 0, "data": []}));
+
+        // Writing needs "schreiben"; readers get a message the client shows.
+        let add = format!("/api/ab/peer/add/{guid}");
+        action(&panel, "POST", &add, &ben, json!({"id": "Server-1", "password": "geheim", "hash": "x", "tags": []})).await;
+        let res = call(&panel, "POST", &add, Some(&carl), Some(json!({"id": "Server-2"}))).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert!(json_of_any(res).await["error"].as_str().unwrap().contains("nur lesen"));
+        let res = call(&panel, "POST", &format!("/api/ab/tag/add/{guid}"), Some(&carl), Some(json!({"name": "X"}))).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        action(&panel, "POST", &format!("/api/ab/tag/add/{guid}"), &ben, json!({"name": "Linux", "color": 1})).await;
+
+        // Everybody with access reads the entry; a shared book keeps no password hash.
+        let peers_path = format!("/api/ab/peers?ab={guid}");
+        for token in [&anna, &ben, &carl, &felix] {
+            let page = json_of(call(&panel, "POST", &peers_path, Some(token), None).await).await;
+            assert_eq!(page["data"][0]["id"], "Server-1");
+            assert_eq!(page["data"][0]["password"], "geheim");
+            assert!(page["data"][0].get("hash").is_none());
+        }
+        let res = call(&panel, "POST", &peers_path, Some(&dora), None).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let res = call(&panel, "POST", &format!("/api/ab/tags/{guid}"), Some(&dora), None).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // The personal book keeps working and keeps no password.
+        let personal = json_of(call(&panel, "POST", "/api/ab/personal", Some(&ben), None).await).await
+            ["guid"].as_str().unwrap().to_owned();
+        action(&panel, "POST", &format!("/api/ab/peer/add/{personal}"), &ben,
+            json!({"id": "Ben-PC", "password": "nicht-speichern", "hash": "abc"})).await;
+        let page = json_of(call(&panel, "POST", &format!("/api/ab/peers?ab={personal}"), Some(&ben), None).await).await;
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["data"][0]["hash"], "abc");
+        assert!(page["data"][0].get("password").is_none());
+        // Not even an admin reads somebody's personal book.
+        let res = call(&panel, "POST", &format!("/api/ab/peers?ab={personal}"), Some(&felix), None).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // Leaving the group or deleting it ends the share.
+        db.remove_group_member("Team", "ben").await.unwrap();
+        assert_eq!(profiles(ben.clone()).await["data"][0]["rule"], 1);
+        db.delete_ab_rule(&guid, "user", "ben").await.unwrap();
+        db.add_group_member("Team", "ben").await.unwrap();
+        db.delete_group("Team").await.unwrap();
+        assert_eq!(profiles(ben.clone()).await["total"], 0);
     }
 
     #[hbb_common::tokio::test]

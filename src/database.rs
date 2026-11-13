@@ -205,6 +205,17 @@ impl Database {
                 owner varchar(100) not null default '',
                 grp varchar(100) not null default ''
             )",
+            // The client tells books apart by name, so shared books have unique names.
+            "create unique index if not exists index_ab_shared_name on ab (name collate nocase) where personal = 0",
+            // Who may use a shared book: kind 'user' or 'group', rule 1 lesen, 2 schreiben,
+            // 3 voll (as ShareRule in the client).
+            "create table if not exists ab_rule (
+                ab varchar(36) not null,
+                kind varchar(10) not null,
+                name varchar(100) not null,
+                rule integer not null,
+                primary key (ab, kind, name)
+            )",
         ] {
             sqlx::query(statement)
                 .execute(self.pool.get().await?.deref_mut())
@@ -368,11 +379,117 @@ impl Database {
         Ok(guid)
     }
 
-    pub async fn ab_owner(&self, guid: &str) -> ResultType<Option<String>> {
-        Ok(sqlx::query_scalar::<_, String>("select owner from ab where guid = ?")
+    /// An address book, personal or shared.
+    pub async fn get_ab(&self, guid: &str) -> ResultType<Option<AbRow>> {
+        let row = sqlx::query_as::<_, (String, String, String, i64)>(
+            "select guid, owner, name, personal from ab where guid = ?",
+        )
+        .bind(guid)
+        .fetch_optional(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(row.map(|(guid, owner, name, personal)| AbRow {
+            guid,
+            owner,
+            name,
+            personal: personal != 0,
+        }))
+    }
+
+    /// All shared books with the best rule `user` has on each through a share for the user
+    /// or one of the user's groups (0 for none), sorted by name.
+    pub async fn shared_abs_for(&self, user: &str) -> ResultType<Vec<(AbRow, i64)>> {
+        let rows = sqlx::query_as::<_, (String, String, String, i64)>(
+            "select a.guid, a.owner, a.name, coalesce((select max(r.rule) from ab_rule r where r.ab = a.guid
+                and ((r.kind = 'user' and r.name = ?)
+                  or (r.kind = 'group' and r.name in (select grp from user_group_member where user = ?)))), 0)
+             from ab a where a.personal = 0 order by a.name collate nocase",
+        )
+        .bind(user)
+        .bind(user)
+        .fetch_all(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(guid, owner, name, rule)| {
+                let row = AbRow {
+                    guid,
+                    owner,
+                    name,
+                    personal: false,
+                };
+                (row, rule)
+            })
+            .collect())
+    }
+
+    /// A new shared book; None if a shared book with that name (in any case) exists.
+    pub async fn create_shared_ab(&self, owner: &str, name: &str) -> ResultType<Option<String>> {
+        let guid = uuid::Uuid::new_v4().to_string();
+        let done = sqlx::query("insert or ignore into ab(guid, owner, name, personal) values(?, ?, ?, 0)")
+            .bind(&guid)
+            .bind(owner)
+            .bind(name)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok((done.rows_affected() > 0).then(|| guid))
+    }
+
+    /// Renames a shared book; false if another shared book has that name.
+    pub async fn rename_shared_ab(&self, guid: &str, name: &str) -> ResultType<bool> {
+        let done = sqlx::query("update or ignore ab set name = ? where guid = ? and personal = 0")
+            .bind(name)
             .bind(guid)
-            .fetch_optional(self.pool.get().await?.deref_mut())
-            .await?)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// Deletes a shared book with its entries, tags and shares.
+    pub async fn delete_shared_ab(&self, guid: &str) -> ResultType<()> {
+        let mut conn = self.pool.get().await?;
+        for statement in [
+            "delete from ab_peer where ab = ?",
+            "delete from ab_tag where ab = ?",
+            "delete from ab_rule where ab = ?",
+            "delete from ab where guid = ? and personal = 0",
+        ] {
+            sqlx::query(statement)
+                .bind(guid)
+                .execute(conn.deref_mut())
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// The shares of a book as (kind, name, rule), groups first.
+    pub async fn ab_rules(&self, guid: &str) -> ResultType<Vec<(String, String, i64)>> {
+        Ok(sqlx::query_as::<_, (String, String, i64)>(
+            "select kind, name, rule from ab_rule where ab = ? order by kind, name collate nocase",
+        )
+        .bind(guid)
+        .fetch_all(self.pool.get().await?.deref_mut())
+        .await?)
+    }
+
+    pub async fn set_ab_rule(&self, guid: &str, kind: &str, name: &str, rule: i64) -> ResultType<()> {
+        sqlx::query("insert or replace into ab_rule(ab, kind, name, rule) values(?, ?, ?, ?)")
+            .bind(guid)
+            .bind(kind)
+            .bind(name)
+            .bind(rule)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_ab_rule(&self, guid: &str, kind: &str, name: &str) -> ResultType<()> {
+        sqlx::query("delete from ab_rule where ab = ? and kind = ? and name = ?")
+            .bind(guid)
+            .bind(kind)
+            .bind(name)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
     }
 
     /// The entries of an address book as JSON strings, sorted by id.
@@ -545,12 +662,14 @@ impl Database {
         Ok(done.rows_affected() > 0)
     }
 
-    /// Deletes a group with its members; its devices keep their owner but lose the group.
+    /// Deletes a group with its members and shares; its devices keep their owner but lose the
+    /// group.
     pub async fn delete_group(&self, name: &str) -> ResultType<()> {
         let mut conn = self.pool.get().await?;
         for statement in [
             "delete from user_group_member where grp = ?",
             "update device_owner set grp = '' where grp = ?",
+            "delete from ab_rule where kind = 'group' and name = ?",
             "delete from user_group where name = ?",
         ] {
             sqlx::query(statement)
@@ -658,6 +777,15 @@ impl Database {
         .await?;
         Ok(done.rows_affected() > 0)
     }
+}
+
+/// An address book.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AbRow {
+    pub guid: String,
+    pub owner: String,
+    pub name: String,
+    pub personal: bool,
 }
 
 /// A user of the panel list.
