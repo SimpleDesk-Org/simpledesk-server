@@ -257,6 +257,7 @@ impl RendezvousServer {
             (port - 2) as u16,
             rs.pm.clone(),
             rs.tcp_peers.clone(),
+            key.clone(),
         ));
         let mut listener = create_tcp_listener(internal_addr, port).await?;
         let mut listener2 = create_tcp_listener(internal_addr, nat_port).await?;

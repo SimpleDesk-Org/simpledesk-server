@@ -24,6 +24,7 @@ const MAX_PAGE_SIZE: usize = 1000;
 
 pub(crate) fn routes() -> Router {
     Router::new()
+        .route("/api/simpledesk/server-info", get(server_info))
         .route("/api/login-options", get(login_options))
         .route("/api/login", post(login))
         .route("/api/oidc/auth", post(oidc_auth))
@@ -105,6 +106,18 @@ fn user_json(name: &str) -> Value {
         "is_admin": true,
         "info": {},
     })
+}
+
+/// What the SimpleDesk client reads when somebody types in the server address for the first
+/// time: the key it needs to trust this server. No login, the key is public anyway. Keep these
+/// three fields as they are, the client depends on them.
+async fn server_info(Extension(panel): Extension<Arc<Panel>>) -> Response {
+    Json(json!({
+        "key": panel.public_key,
+        "name": "SimpleDesk",
+        "version": crate::version::VERSION,
+    }))
+    .into_response()
 }
 
 /// The client shows a button for every "oidc/<name>".
@@ -610,6 +623,24 @@ mod tests {
 
     async fn json_of_any(res: Response) -> Value {
         serde_json::from_str(&text(res).await).unwrap()
+    }
+
+    #[hbb_common::tokio::test]
+    async fn server_info_names_the_key_without_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let pm = crate::peer::test_peer_map(&dir).await;
+        let key = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=";
+        let panel = Arc::new(
+            Panel::new(pm, Default::default())
+                .await
+                .unwrap()
+                .with_public_key(key.to_owned()),
+        );
+        let res = call(&panel, "GET", "/api/simpledesk/server-info", None, None).await;
+        assert_eq!(
+            json_of(res).await,
+            json!({"key": key, "name": "SimpleDesk", "version": crate::version::VERSION})
+        );
     }
 
     #[hbb_common::tokio::test]

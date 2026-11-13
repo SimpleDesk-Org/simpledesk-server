@@ -46,6 +46,8 @@ pub(crate) struct Panel {
     sessions: Mutex<HashMap<String, Session>>,
     /// Login through an OIDC provider such as Eider. Without it nobody can sign in.
     pub(crate) oidc: Option<Oidc>,
+    /// The key clients need, the same text as id_ed25519.pub.
+    pub(crate) public_key: String,
 }
 
 impl Panel {
@@ -69,7 +71,13 @@ impl Panel {
             tcp_peers,
             sessions: Default::default(),
             oidc,
+            public_key: String::new(),
         })
+    }
+
+    pub(crate) fn with_public_key(mut self, key: String) -> Self {
+        self.public_key = key;
+        self
     }
 
     #[cfg(test)]
@@ -239,13 +247,19 @@ struct AbDeleteForm {
 }
 
 /// Starts the panel unless PANEL=N. Errors are logged; the rest of hbbs keeps running.
-pub(crate) async fn start(bind_addr: Option<IpAddr>, port: u16, pm: PeerMap, tcp_peers: TcpPeers) {
+pub(crate) async fn start(
+    bind_addr: Option<IpAddr>,
+    port: u16,
+    pm: PeerMap,
+    tcp_peers: TcpPeers,
+    public_key: String,
+) {
     if get_arg("PANEL").to_uppercase() == "N" {
         log::info!("SimpleDesk web panel is off (PANEL=N)");
         return;
     }
     let panel = match Panel::new(pm, tcp_peers).await {
-        Ok(panel) => Arc::new(panel),
+        Ok(panel) => Arc::new(panel.with_public_key(public_key)),
         Err(err) => {
             log::error!("SimpleDesk web panel failed to start: {}", err);
             return;
