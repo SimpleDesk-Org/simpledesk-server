@@ -165,6 +165,8 @@ const LOGIN_REQUIRED_MESSAGE: &str =
     "Bitte melde dich in SimpleDesk an (Konto → Anmelden), dann kannst du dich verbinden.";
 /// What a signed-in user sees who may not control the device (SimpleDesk, LOGIN_REQUIRED=Y).
 const NOT_ALLOWED_MESSAGE: &str = "Du darfst dieses Gerät nicht steuern.";
+/// What everybody sees for a device that no admin gave an ID yet (SimpleDesk, IDS_BY_ADMIN=Y).
+const NO_ID_MESSAGE: &str = "Dieses Gerät hat noch keine ID.";
 
 #[derive(Clone)]
 pub struct RendezvousServer {
@@ -802,6 +804,20 @@ impl RendezvousServer {
         if rk.id == rk.old_id {
             return OK;
         }
+        // SimpleDesk, IDS_BY_ADMIN: only to the ID an admin chose for this device.
+        if self.pm.accounts.ids_by_admin {
+            match self.pm.db.id_assignment(&rk.uuid).await {
+                Ok(Some(assigned)) if assigned == rk.id => {}
+                Ok(_) => {
+                    log::warn!("Change id of {} to {} refused: no admin gave this ID", rk.old_id, rk.id);
+                    return register_pk_response::Result::NOT_SUPPORT;
+                }
+                Err(err) => {
+                    log::error!("Change id of {} refused: reading the ID failed: {}", rk.old_id, err);
+                    return register_pk_response::Result::SERVER_ERROR;
+                }
+            }
+        }
         if let Some(peer) = self.pm.get(&rk.id).await {
             let uuid = peer.read().await.uuid.clone();
             if !uuid.is_empty() {
@@ -843,19 +859,23 @@ impl RendezvousServer {
     /// SimpleDesk: why a connection request to device `id` may not go on, None if it may.
     /// Always None unless LOGIN_REQUIRED=Y; then the access token must belong to a signed-in
     /// user who may control the device (an admin, its owner or a member of its group).
+    /// With IDS_BY_ADMIN, a device is reachable only under the ID an admin gave it.
     async fn refusal(&self, token: &str, id: &str, from: SocketAddr) -> Option<&'static str> {
-        if !self.inner.login_required {
-            return None;
+        if self.inner.login_required {
+            let Some(user) = crate::api::token_user(&self.pm, token).await else {
+                log::info!("Connection to {} from {} refused: not signed in", id, from);
+                return Some(LOGIN_REQUIRED_MESSAGE);
+            };
+            if !crate::api::may_control(&self.pm, &user, id).await {
+                log::info!("Connection to {} from {} refused: {} may not control it", id, from, user);
+                return Some(NOT_ALLOWED_MESSAGE);
+            }
         }
-        let Some(user) = crate::api::token_user(&self.pm, token).await else {
-            log::info!("Connection to {} from {} refused: not signed in", id, from);
-            return Some(LOGIN_REQUIRED_MESSAGE);
-        };
-        if crate::api::may_control(&self.pm, &user, id).await {
-            return None;
+        if self.pm.accounts.ids_by_admin && !crate::api::id_usable(&self.pm, id).await {
+            log::info!("Connection to {} from {} refused: no ID from an admin yet", id, from);
+            return Some(NO_ID_MESSAGE);
         }
-        log::info!("Connection to {} from {} refused: {} may not control it", id, from, user);
-        Some(NOT_ALLOWED_MESSAGE)
+        None
     }
 
     /// SimpleDesk: the device echoed the heartbeat, so it is still online.
@@ -2032,6 +2052,64 @@ mod tests {
         // Without LOGIN_REQUIRED nothing is checked, as before.
         let open = test_server_with(&dir, false).await;
         assert_eq!(open.refusal("", "Lager-PC", requester).await, None);
+    }
+
+    #[hbb_common::tokio::test]
+    async fn only_admins_give_ids() {
+        use register_pk_response::Result::{NOT_SUPPORT, OK};
+        let dir = tempfile::tempdir().unwrap();
+        let mut rs = test_server_with(&dir, false).await;
+        let from: SocketAddr = "192.0.2.77:4000".parse().unwrap();
+        // Devices registered before IDS_BY_ADMIN keep their ID.
+        online_device(&rs, "Alt-PC", b"uuid-alt", "198.51.100.4:5000").await;
+        rs.pm.db.drop_id_tables().await.unwrap();
+        let path = dir.path().join("db_v2.sqlite3");
+        let db = crate::database::Database::new(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(db.id_assignment(b"uuid-alt").await.unwrap().as_deref(), Some("Alt-PC"));
+        rs.pm.accounts = Arc::new(crate::accounts::Accounts::with_ids_by_admin("felix"));
+        assert_eq!(rs.refusal("", "Alt-PC", from).await, None);
+
+        // A new device registers with its own ID but cannot be reached.
+        online_device(&rs, "123456789", b"uuid-neu", "198.51.100.5:5000").await;
+        assert_eq!(rs.refusal("", "123456789", from).await, Some(NO_ID_MESSAGE));
+        assert_eq!(rs.refusal("", "Gibt-Es-Nicht", from).await, None);
+        let change = |old_id: &str, id: &str, uuid: &'static [u8]| RegisterPk {
+            old_id: old_id.to_owned(),
+            id: id.to_owned(),
+            uuid: Bytes::from_static(uuid),
+            ..Default::default()
+        };
+
+        // Without a change an admin approved, the device cannot pick an ID itself.
+        assert_eq!(rs.change_id_result(&change("123456789", "Rathaus-PC", b"uuid-neu"), from).await, NOT_SUPPORT);
+        assert_eq!(rs.change_id_result(&change("Alt-PC", "Mein-PC", b"uuid-alt"), from).await, NOT_SUPPORT);
+
+        // The admin gives it an ID: until the device took it, its old ID stays unreachable.
+        let uuid = b"uuid-neu".to_vec();
+        assert_eq!(crate::api::assign_id(&rs.pm, "123456789", &uuid, "Rathaus-PC").await.unwrap(), Ok(()));
+        assert_eq!(rs.refusal("", "123456789", from).await, Some(NO_ID_MESSAGE));
+        assert_eq!(rs.change_id_result(&change("123456789", "Anders-PC", b"uuid-neu"), from).await, NOT_SUPPORT);
+        // Another device cannot take the ID the admin gave.
+        assert_eq!(rs.change_id_result(&change("Alt-PC", "Rathaus-PC", b"uuid-alt"), from).await, NOT_SUPPORT);
+        assert_eq!(rs.change_id_result(&change("123456789", "Rathaus-PC", b"uuid-neu"), from).await, OK);
+        assert!(rs.pm.get("Rathaus-PC").await.is_some());
+        assert_eq!(rs.refusal("", "Rathaus-PC", from).await, None);
+
+        // Keeping the ID it made up works too; taken or malformed IDs are refused.
+        online_device(&rs, "987654321", b"uuid-drei", "198.51.100.6:5000").await;
+        let uuid = b"uuid-drei".to_vec();
+        for (new_id, error) in [("rathaus-pc", "schon vergeben"), ("Alt-PC", "schon vergeben"), ("1-falsch", "Buchstaben")] {
+            let res = crate::api::assign_id(&rs.pm, "987654321", &uuid, new_id).await.unwrap();
+            assert!(res.unwrap_err().contains(error), "{new_id}");
+        }
+        assert_eq!(crate::api::assign_id(&rs.pm, "987654321", &uuid, "987654321").await.unwrap(), Ok(()));
+        assert_eq!(rs.refusal("", "987654321", from).await, None);
+
+        // Without IDS_BY_ADMIN everything is as before.
+        rs.pm.accounts = Arc::new(crate::accounts::Accounts::default());
+        online_device(&rs, "555555555", b"uuid-frei", "198.51.100.7:5000").await;
+        assert_eq!(rs.refusal("", "555555555", from).await, None);
+        assert_eq!(rs.change_id_result(&change("555555555", "Frei-PC", b"uuid-frei"), from).await, OK);
     }
 
     async fn serve_one(rs: &RendezvousServer, ws: bool) -> SocketAddr {

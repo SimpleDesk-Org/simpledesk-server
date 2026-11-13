@@ -110,6 +110,12 @@ td.id { font-weight: 600; }
 footer.source { margin: 0 auto 32px; padding: 0 16px; text-align: center; font-size: 13px; color: var(--muted); }
 footer.source a { color: var(--muted); }
 .table-wrap { overflow-x: auto; }
+input.short { display: inline-block; width: 11em; margin-top: 0; }
+.pending { display: block; font-size: 12px; font-weight: 400; color: var(--muted); }
+details.change-id { margin-top: 4px; text-align: left; }
+details.change-id summary { color: var(--accent); cursor: pointer; text-align: right; }
+details.change-id form { margin-top: 6px; justify-content: flex-end; }
+details.change-id .hint { margin: 6px 0 0; font-size: 12px; text-align: right; }
 button.link.danger { color: var(--error); }
 label select { display: block; margin-top: 6px; }
 select {

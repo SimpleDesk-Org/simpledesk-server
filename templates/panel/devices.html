@@ -2,7 +2,44 @@
 {% block title %}Geräte{% endblock %}
 {% block nav %}{% include "panel/nav.html" %}{% endblock %}
 {% block content %}
-<section class="card">
+{% if admin && ids_by_admin %}
+<section class="card new-devices">
+  <h1>Neue Geräte (ohne ID)</h1>
+  <p class="hint">Diese Geräte haben sich gemeldet, aber noch keine ID von einem Admin. Bis dahin kann sich niemand mit ihnen verbinden.
+  Gib eine ID ein (oder lass die vorgeschlagene stehen) und klick auf „ID vergeben“. Das Gerät übernimmt sie nach ein paar Sekunden, sobald es online ist.</p>
+  {% if new_devices.is_empty() %}
+  <p class="empty">Gerade wartet kein Gerät auf eine ID.</p>
+  {% else %}
+  <div class="table-wrap">
+  <table>
+    <thead>
+      <tr><th>Rechner</th><th>Benutzer</th><th>System</th><th>IP</th><th>Zuerst gesehen (UTC)</th><th>ID</th></tr>
+    </thead>
+    <tbody>
+      {% for device in new_devices %}
+      <tr>
+        <td class="id">{% if device.hostname.is_empty() %}–{% else %}{{ device.hostname }}{% endif %}</td>
+        <td>{% if device.username.is_empty() %}–{% else %}{{ device.username }}{% endif %}</td>
+        <td>{% if device.os.is_empty() %}–{% else %}{{ device.os }}{% endif %}</td>
+        <td>{{ device.ip }}</td>
+        <td>{{ device.first_seen }}</td>
+        <td>
+          <form class="inline" method="post" action="/devices/set-id">
+            <input type="hidden" name="id" value="{{ device.id }}">
+            <input class="short" name="new_id" value="{{ device.id }}" required maxlength="16" aria-label="Neue ID für {{ device.hostname }}">
+            <button type="submit">ID vergeben</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+</section>
+{% endif %}
+
+<section class="card{% if admin && ids_by_admin %} add{% endif %}">
   <h1>Geräte</h1>
   <p class="hint">{% if devices.len() == 1 %}1 Gerät{% else %}{{ devices.len() }} Geräte{% endif %}, davon {{ online }} online.
   {% if admin %}Als Admin siehst und steuerst du alle Geräte. Gib einem Gerät einen Besitzer oder eine Gruppe, dann dürfen auch diese es steuern.{% else %}Du siehst deine Geräte und die Geräte deiner Gruppen.{% endif %}</p>
@@ -18,7 +55,7 @@
     <tbody>
       {% for device in devices %}
       <tr>
-        <td class="id">{{ device.id }}</td>
+        <td class="id">{{ device.id }}{% if !device.pending_id.is_empty() %}<span class="pending">wird zu {{ device.pending_id }}</span>{% endif %}</td>
         <td>{% if device.online %}<span class="dot on"></span>online{% else %}<span class="dot off"></span>offline{% endif %}</td>
         <td>{% if device.online %}{% if device.websocket %}WebSocket (443){% else %}UDP{% endif %}{% else %}–{% endif %}</td>
         <td>{{ device.ip }}</td>
@@ -31,6 +68,15 @@
             <input type="hidden" name="id" value="{{ device.id }}">
             <button class="link" type="submit">Speichern</button>
           </form>
+          <details class="change-id">
+            <summary>ID ändern</summary>
+            <form class="inline" method="post" action="/devices/set-id">
+              <input type="hidden" name="id" value="{{ device.id }}">
+              <input class="short" name="new_id" value="{% if device.pending_id.is_empty() %}{{ device.id }}{% else %}{{ device.pending_id }}{% endif %}" required maxlength="16" aria-label="Neue ID für {{ device.id }}">
+              <button type="submit">Ändern</button>
+            </form>
+            <p class="hint">Das Gerät übernimmt die neue ID nach ein paar Sekunden, sobald es online ist.</p>
+          </details>
         </td>
         {% else %}
         <td>{% if device.owner.is_empty() %}–{% else %}{{ device.owner }}{% endif %}</td>

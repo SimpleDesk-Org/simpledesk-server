@@ -6,6 +6,9 @@
 //! PANEL_SESSION_HOURS: how many hours a login in the web panel lasts (default 8).
 //! ADMIN_USERS: user names at the provider, separated by commas, who are admins. Admins see and
 //! control every device and manage users and groups. Everybody else is a Benutzer.
+//! IDS_BY_ADMIN=Y: only admins give devices their ID. A new device can be reached only after
+//! an admin gave it an ID in the panel, and a device may change its ID only to the one an
+//! admin chose for it.
 
 use crate::common::get_arg;
 use hbb_common::log;
@@ -21,6 +24,8 @@ pub(crate) struct Accounts {
     pub(crate) session_hours: i64,
     /// Names of the admins in lower case.
     pub(crate) admins: Vec<String>,
+    /// IDS_BY_ADMIN=Y: device IDs come from admins only.
+    pub(crate) ids_by_admin: bool,
 }
 
 impl Default for Accounts {
@@ -29,6 +34,7 @@ impl Default for Accounts {
             token_days: DEFAULT_TOKEN_DAYS,
             session_hours: DEFAULT_SESSION_HOURS,
             admins: Vec::new(),
+            ids_by_admin: false,
         }
     }
 }
@@ -39,11 +45,13 @@ impl Accounts {
             token_days: positive("TOKEN_DAYS", DEFAULT_TOKEN_DAYS),
             session_hours: positive("PANEL_SESSION_HOURS", DEFAULT_SESSION_HOURS),
             admins: parse_names(&get_arg("ADMIN_USERS")),
+            ids_by_admin: get_arg("IDS_BY_ADMIN").trim().to_uppercase() == "Y",
         };
         log::info!(
-            "TOKEN_DAYS={}, PANEL_SESSION_HOURS={}",
+            "TOKEN_DAYS={}, PANEL_SESSION_HOURS={}, IDS_BY_ADMIN={}",
             accounts.token_days,
-            accounts.session_hours
+            accounts.session_hours,
+            if accounts.ids_by_admin { "Y" } else { "N" }
         );
         if accounts.admins.is_empty() {
             log::warn!("ADMIN_USERS is empty: nobody can manage users, and devices without owner cannot be controlled");
@@ -65,6 +73,14 @@ impl Accounts {
         Self {
             admins: parse_names(admins),
             ..Default::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_ids_by_admin(admins: &str) -> Self {
+        Self {
+            ids_by_admin: true,
+            ..Self::with_admins(admins)
         }
     }
 }

@@ -15,4 +15,6 @@ WORKDIR /root
 ENV WS_ONLY=Y
 # Only signed-in users may connect to a device.
 ENV LOGIN_REQUIRED=Y
+# Only admins give devices their ID, in the web panel.
+ENV IDS_BY_ADMIN=Y
 EXPOSE 21118 21119

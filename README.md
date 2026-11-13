@@ -6,7 +6,7 @@ SimpleDesk ist ein Fork des kostenlosen RustDesk-Servers ([rustdesk/rustdesk-ser
 
 - Geräte können sich auch über TCP und WebSocket anmelden, nicht nur über UDP. Die Verbindung bleibt offen, der Server schickt alle 20 Sekunden ein Lebenszeichen, und Anfragen anderer Geräte kommen über diese Verbindung.
 - Neuer Schalter `WS_ONLY=Y` für hbbs und hbbr: Nur die WebSocket-Ports (21118 und 21119) lauschen auf der Bind-Adresse, alle anderen Ports nur auf 127.0.0.1. Verbindungen laufen dann immer über das Relay.
-- Ein Gerät kann seine ID ändern (`--set-id`).
+- Ein Gerät kann seine ID ändern (`--set-id`), mit `IDS_BY_ADMIN=Y` aber nur auf die ID, die ein Admin vergeben hat.
 - Web-Panel in hbbs auf Port 21114: Anmelden über Eider, Geräteliste mit Online-Status, Besitzer und Gruppe, eigenes und geteilte Adressbücher, für Admins die Seite „Benutzer“. Abschalten mit `PANEL=N`.
 - API für den Client auf demselben Port: Anmelden über Eider im Browser, eigenes und geteilte Adressbücher mit Einträgen und Tags. Heartbeat und Systeminfo werden ruhig beantwortet. `GET /api/simpledesk/server-info` nennt ohne Anmeldung den Key des Servers (wie in `id_ed25519.pub`), damit der Client sich beim ersten Start selbst einrichten kann.
 - Neuer Schalter `LOGIN_REQUIRED=Y` (im Docker-Image Standard): Verbinden darf nur, wer im Client angemeldet ist und das Gerät steuern darf (siehe unten). Der Server prüft den Token, den der Client mit jeder Verbindungsanfrage schickt. Ohne Anmeldung sieht man „Bitte melde dich in SimpleDesk an“, ohne Recht „Du darfst dieses Gerät nicht steuern.“ Das gilt auch für den normalen RustDesk-Client. Geräte, auf die man zugreift, brauchen keine Anmeldung.
@@ -32,6 +32,7 @@ Der Anbieter muss Discovery, den Code-Flow mit PKCE (S256) und ein ID-Token mit 
 | `ADMIN_USERS` | Admins, mit Komma getrennt, zum Beispiel `felix,it-admin`. Es sind die Benutzernamen bei Eider, groß oder klein ist egal. |
 | `TOKEN_DAYS` | So viele Tage bleibt der Client nach der Anmeldung angemeldet. Standard `14`. |
 | `PANEL_SESSION_HOURS` | So viele Stunden bleibt das Panel nach der Anmeldung angemeldet. Standard `8`. |
+| `IDS_BY_ADMIN` | `Y`: IDs vergibt nur ein Admin (siehe unten). Im Docker-Image Standard, sonst aus. |
 
 **Setz `ADMIN_USERS` vor dem Update.** Ohne Admins kann niemand die Seite „Benutzer“ öffnen, und Geräte ohne Besitzer kann mit `LOGIN_REQUIRED=Y` niemand mehr steuern.
 
@@ -41,6 +42,14 @@ Der Anbieter muss Discovery, den Code-Flow mit PKCE (S256) und ein ID-Token mit 
 - **Gruppen** legen Admins auf der Seite „Benutzer“ an. Dort fügen sie auch Leute hinzu.
 - **Abmelden** (Seite „Benutzer“) beendet alle Anmeldungen einer Person in Clients und Panel. Danach kann sie sich wieder anmelden. **Sperren** meldet sie ab, und sie kommt nicht mehr herein, bis ein Admin sie entsperrt.
 - **Ablauf:** Eider gibt keine Refresh-Tokens heraus. SimpleDesk prüft die Lizenz also nur bei der Anmeldung. Verliert jemand bei Eider die Lizenz, bleibt er höchstens `TOKEN_DAYS` Tage angemeldet. Soll es sofort gelten, klick auf „Sperren“. Ist die Anmeldung abgelaufen, meldet sich der Client von selbst ab.
+
+## IDs vergibt der Admin (`IDS_BY_ADMIN=Y`)
+
+- Ein neues Gerät meldet sich mit der ID an, die es sich selbst ausgedacht hat. Verbinden kann sich damit aber niemand („Dieses Gerät hat noch keine ID.“).
+- Admins sehen es im Panel unter „Neue Geräte (ohne ID)“ mit Rechnername, Benutzer, System und IP. Mit „ID vergeben“ bekommt es seine ID. Die vorgeschlagene ID kann man auch einfach stehen lassen.
+- Mit „ID ändern“ geben Admins einem Gerät eine neue ID. Das Gerät übernimmt sie mit seinem nächsten Heartbeat, also nach ein paar Sekunden, sobald es online ist. Eine neue ID muss mit einem Buchstaben anfangen und 6 bis 16 Zeichen lang sein. Das Übernehmen kann erst der neue SimpleDesk-Client.
+- Ein Gerät darf seine ID nicht selbst ändern, nur auf die ID, die ein Admin für es gewählt hat. Admins können das auch im Client tun (`/api/simpledesk/change-id`).
+- Geräte, die schon vor dem Update angemeldet waren, behalten ihre ID.
 
 ## Geteilte Adressbücher
 

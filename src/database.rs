@@ -224,6 +224,123 @@ impl Database {
         self.add_column("api_token", "last_used", "datetime").await?;
         self.add_column("panel_user", "last_login", "datetime").await?;
         self.add_column("panel_user", "blocked", "integer not null default 0").await?;
+        self.create_id_tables().await?;
+        Ok(())
+    }
+
+    /// The IDs admins give devices (IDS_BY_ADMIN) and what devices tell about themselves.
+    async fn create_id_tables(&self) -> ResultType<()> {
+        let mut conn = self.pool.get().await?;
+        let fresh = sqlx::query_scalar::<_, String>(
+            "select name from sqlite_master where type = 'table' and name = 'device_id'",
+        )
+        .fetch_optional(conn.deref_mut())
+        .await?
+        .is_none();
+        for statement in [
+            // The ID each device (by uuid) shall have. A device whose current ID differs
+            // takes this one with its next heartbeat.
+            "create table if not exists device_id (
+                uuid blob primary key not null,
+                assigned_id varchar(100) not null,
+                assigned_at datetime not null default(current_timestamp)
+            )",
+            // The last system info of a device (hostname, username, os, ...), as JSON.
+            "create table if not exists device_info (
+                uuid blob primary key not null,
+                data text not null,
+                updated_at datetime not null default(current_timestamp)
+            )",
+        ] {
+            sqlx::query(statement).execute(conn.deref_mut()).await?;
+        }
+        if fresh {
+            // Devices that are here before admins give IDs keep the ID they have. With two
+            // rows for one uuid the newest wins.
+            let done = sqlx::query(
+                "insert or ignore into device_id(uuid, assigned_id)
+                 select uuid, id from peer where length(uuid) > 0 order by created_at desc",
+            )
+            .execute(conn.deref_mut())
+            .await?;
+            log::info!("SimpleDesk: {} registered devices keep their ID", done.rows_affected());
+        }
+        Ok(())
+    }
+
+    /// The ID an admin gave the device with this uuid, None if none yet.
+    pub async fn id_assignment(&self, uuid: &[u8]) -> ResultType<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>("select assigned_id from device_id where uuid = ?")
+            .bind(uuid)
+            .fetch_optional(self.pool.get().await?.deref_mut())
+            .await?)
+    }
+
+    /// For a registered device ID: the ID an admin gave its device (None if none yet).
+    /// None outside if no device has this ID.
+    pub async fn id_assignment_of(&self, id: &str) -> ResultType<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "select d.assigned_id from peer p left join device_id d on d.uuid = p.uuid where p.id = ?",
+        )
+        .bind(id)
+        .fetch_optional(self.pool.get().await?.deref_mut())
+        .await?)
+    }
+
+    pub async fn set_id_assignment(&self, uuid: &[u8], id: &str) -> ResultType<()> {
+        sqlx::query("insert or replace into device_id(uuid, assigned_id) values(?, ?)")
+            .bind(uuid)
+            .bind(id)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
+    }
+
+    /// The uuid of the registered device with this ID.
+    pub async fn device_uuid(&self, id: &str) -> ResultType<Option<Vec<u8>>> {
+        Ok(sqlx::query_scalar::<_, Vec<u8>>("select uuid from peer where id = ?")
+            .bind(id)
+            .fetch_optional(self.pool.get().await?.deref_mut())
+            .await?)
+    }
+
+    /// Whether another device (another uuid) has this ID or is about to get it. Upper and
+    /// lower case do not count as different.
+    pub async fn id_taken(&self, id: &str, uuid: &[u8]) -> ResultType<bool> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "select 1 from peer where id = ? collate nocase and uuid != ?
+             union all select 1 from device_id where assigned_id = ? collate nocase and uuid != ?",
+        )
+        .bind(id)
+        .bind(uuid)
+        .bind(id)
+        .bind(uuid)
+        .fetch_optional(self.pool.get().await?.deref_mut())
+        .await?
+        .is_some())
+    }
+
+    /// Stores what a registered device tells about itself; false if no device with this
+    /// ID and uuid is registered.
+    pub async fn save_device_info(&self, id: &str, uuid: &[u8], data: &str) -> ResultType<bool> {
+        let done = sqlx::query(
+            "insert or replace into device_info(uuid, data)
+             select uuid, ? from peer where id = ? and uuid = ?",
+        )
+        .bind(data)
+        .bind(id)
+        .bind(uuid)
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// Tests: forget all given IDs, as in a database from before IDS_BY_ADMIN.
+    #[cfg(test)]
+    pub async fn drop_id_tables(&self) -> ResultType<()> {
+        sqlx::query("drop table device_id")
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
         Ok(())
     }
 
@@ -717,23 +834,30 @@ impl Database {
         .await?)
     }
 
-    /// All registered devices with owner and group, sorted by id.
+    /// All registered devices with owner, group, the ID an admin gave them and what they
+    /// told about themselves, sorted by id.
     pub async fn list_devices(&self) -> ResultType<Vec<DeviceRow>> {
-        let rows = sqlx::query_as::<_, (String, String, String, String, String)>(
-            "select p.id, p.info, cast(p.created_at as text), coalesce(o.owner, ''), coalesce(o.grp, '')
+        type Row = (String, String, String, String, String, Option<String>, String);
+        let rows = sqlx::query_as::<_, Row>(
+            "select p.id, p.info, cast(p.created_at as text), coalesce(o.owner, ''), coalesce(o.grp, ''),
+                d.assigned_id, coalesce(i.data, '')
              from peer p left join device_owner o on o.guid = p.guid
+                left join device_id d on d.uuid = p.uuid
+                left join device_info i on i.uuid = p.uuid
              order by p.id collate nocase",
         )
         .fetch_all(self.pool.get().await?.deref_mut())
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(id, info, registered, owner, group)| DeviceRow {
+            .map(|(id, info, registered, owner, group, assigned_id, sysinfo)| DeviceRow {
                 id,
                 info,
                 registered,
                 owner,
                 group,
+                assigned_id,
+                sysinfo,
             })
             .collect())
     }
@@ -805,6 +929,10 @@ pub struct DeviceRow {
     pub registered: String,
     pub owner: String,
     pub group: String,
+    /// The ID an admin gave the device, None if none yet.
+    pub assigned_id: Option<String>,
+    /// The device's last system info as JSON, '' if it sent none.
+    pub sysinfo: String,
 }
 
 #[cfg(test)]

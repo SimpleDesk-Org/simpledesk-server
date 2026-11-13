@@ -32,6 +32,8 @@ Gearbeitet wird jeweils auf dem Branch `simpledesk`.
 - Rollen Admin (`ADMIN_USERS`) und Benutzer, Seite „Benutzer“ mit Abmelden, Sperren und Gruppen
 - Geräte haben Besitzer und Gruppe. Benutzer sehen und steuern nur ihre Geräte und die ihrer Gruppen, Admins alle.
 - Geteilte Adressbücher mit den Rechten lesen, schreiben und voll (Client und Panel)
+- IDs vergibt nur ein Admin (`IDS_BY_ADMIN=Y`): neue Geräte im Panel, „ID vergeben“ und „ID ändern“, das Gerät übernimmt die ID über den Heartbeat
+- Panel verlinkt auf jeder Seite den Quellcode (AGPL)
 
 ## Als Nächstes
 

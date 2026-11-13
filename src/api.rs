@@ -27,6 +27,7 @@ const MAX_PAGE_SIZE: usize = 1000;
 pub(crate) fn routes() -> Router {
     Router::new()
         .route("/api/simpledesk/server-info", get(server_info))
+        .route("/api/simpledesk/change-id", post(change_id))
         .route("/api/login-options", get(login_options))
         .route("/api/login", post(login))
         .route("/api/oidc/auth", post(oidc_auth))
@@ -103,6 +104,89 @@ pub(crate) async fn may_control(pm: &PeerMap, user: &str, id: &str) -> bool {
         log::error!("SimpleDesk API: reading the owner of {} failed: {}", id, err);
         false
     })
+}
+
+/// With IDS_BY_ADMIN: whether device `id` may be reached. Only under the ID an admin gave its
+/// device; a new device without one is not reachable. An ID no device has is left to the
+/// usual answer ("ID does not exist").
+pub(crate) async fn id_usable(pm: &PeerMap, id: &str) -> bool {
+    match pm.db.id_assignment_of(id).await {
+        Ok(None) => true,
+        Ok(Some(assigned)) => assigned.as_deref() == Some(id),
+        Err(err) => {
+            log::error!("SimpleDesk API: reading the ID of {} failed: {}", id, err);
+            false
+        }
+    }
+}
+
+/// What an admin sees for an ID a device cannot have.
+pub(crate) const ID_FORMAT_MESSAGE: &str =
+    "Die ID muss mit einem Buchstaben anfangen und 6 bis 16 Zeichen lang sein (Buchstaben, Ziffern, _ oder -).";
+
+/// An admin gives the device with `id` and `uuid` the ID `new_id`; the device takes it with
+/// its next heartbeat. Keeping the current ID is fine too, then it is simply given. Err with
+/// a message for the admin if it cannot be done.
+pub(crate) async fn assign_id(
+    pm: &PeerMap,
+    id: &str,
+    uuid: &[u8],
+    new_id: &str,
+) -> ResultType<Result<(), &'static str>> {
+    let new_id = new_id.trim();
+    if pm.db.device_uuid(id).await?.as_deref() != Some(uuid) {
+        return Ok(Err("Dieses Gerät ist beim Server nicht angemeldet."));
+    }
+    if new_id != id {
+        if !hbb_common::is_valid_custom_id(new_id) {
+            return Ok(Err(ID_FORMAT_MESSAGE));
+        }
+        if pm.db.id_taken(new_id, uuid).await? {
+            return Ok(Err("Diese ID ist schon vergeben."));
+        }
+    }
+    pm.db.set_id_assignment(uuid, new_id).await?;
+    log::info!("SimpleDesk: device {} gets the ID {}", id, new_id);
+    Ok(Ok(()))
+}
+
+#[derive(Deserialize)]
+struct ChangeIdRequest {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    uuid: String,
+    #[serde(default)]
+    new_id: String,
+}
+
+/// An admin changes a device's ID from the client. Answers 200 `{}`, or 403 with the reason.
+async fn change_id(Extension(panel): Extension<Arc<Panel>>, headers: HeaderMap, body: Bytes) -> Response {
+    let user = match user_of(&panel, &headers).await {
+        Ok(user) => user,
+        Err(res) => return res,
+    };
+    let refuse = |msg: &str| api_error(StatusCode::FORBIDDEN, msg);
+    if !panel.pm.accounts.is_admin(&user) {
+        return refuse("Nur Admins dürfen die ID eines Geräts ändern.");
+    }
+    let Ok(req) = serde_json::from_slice::<ChangeIdRequest>(&body) else {
+        return refuse("Ungültige Anfrage.");
+    };
+    let Ok(uuid) = base64::decode(req.uuid.trim()) else {
+        return refuse("Dieses Gerät ist beim Server nicht angemeldet.");
+    };
+    match assign_id(&panel.pm, req.id.trim(), &uuid, &req.new_id).await {
+        Ok(Ok(())) => {
+            log::info!("SimpleDesk API: {} changes the ID of {} to {}", user, req.id.trim(), req.new_id.trim());
+            Json(json!({})).into_response()
+        }
+        Ok(Err(msg)) => refuse(msg),
+        Err(err) => {
+            log::error!("SimpleDesk API: saving the new ID failed: {}", err);
+            refuse("Serverfehler.")
+        }
+    }
 }
 
 /// After a client login, the user becomes the owner of the device the client runs on, if the
@@ -279,12 +363,67 @@ async fn logout(Extension(panel): Extension<Arc<Panel>>, headers: HeaderMap) -> 
     StatusCode::OK.into_response()
 }
 
-async fn heartbeat() -> Response {
-    Json(json!({})).into_response()
+#[derive(Deserialize)]
+struct HeartbeatRequest {
+    #[serde(default)]
+    uuid: String,
 }
 
-async fn sysinfo() -> Response {
-    "SYSINFO_UPDATED".into_response()
+/// Every few seconds from each device (without a token). The answer tells the device the ID
+/// an admin gave it: `assigned_id` differs from its ID, so it switches to it.
+async fn heartbeat(Extension(panel): Extension<Arc<Panel>>, body: Bytes) -> Response {
+    let pm = &panel.pm;
+    let assigned = match serde_json::from_slice::<HeartbeatRequest>(&body)
+        .ok()
+        .and_then(|req| base64::decode(req.uuid.trim()).ok())
+    {
+        Some(uuid) => match pm.db.id_assignment(&uuid).await {
+            Ok(assigned) => assigned,
+            Err(err) => {
+                log::error!("SimpleDesk API: reading an ID for the heartbeat failed: {}", err);
+                None
+            }
+        },
+        None => None,
+    };
+    Json(json!({
+        "simpledesk": {
+            "id_assigned": !pm.accounts.ids_by_admin || assigned.is_some(),
+            "assigned_id": assigned.unwrap_or_default(),
+        }
+    }))
+    .into_response()
+}
+
+/// The device tells about itself (hostname, username, os, ...); the panel shows it. Only
+/// for a registered device; else the client tries again in two minutes.
+async fn sysinfo(Extension(panel): Extension<Arc<Panel>>, body: Bytes) -> Response {
+    let Ok(Value::Object(info)) = serde_json::from_slice::<Value>(&body) else {
+        return "SYSINFO_LATER".into_response();
+    };
+    let text = |key: &str| info.get(key).and_then(Value::as_str).unwrap_or_default().trim();
+    let Ok(uuid) = base64::decode(text("uuid")) else {
+        return "SYSINFO_LATER".into_response();
+    };
+    let keep = ["hostname", "username", "os", "version", "cpu", "memory"];
+    let data: Map<String, Value> = info
+        .iter()
+        .filter(|(key, value)| keep.contains(&key.as_str()) && value.is_string())
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    match panel
+        .pm
+        .db
+        .save_device_info(text("id"), &uuid, &Value::Object(data).to_string())
+        .await
+    {
+        Ok(true) => "SYSINFO_UPDATED".into_response(),
+        Ok(false) => "SYSINFO_LATER".into_response(),
+        Err(err) => {
+            log::error!("SimpleDesk API: saving the system info failed: {}", err);
+            "SYSINFO_LATER".into_response()
+        }
+    }
 }
 
 /// All address book calls: /api/ab/<rest>, dispatched by method and path.
@@ -905,6 +1044,59 @@ mod tests {
     }
 
     #[hbb_common::tokio::test]
+    async fn heartbeat_tells_the_id_and_only_admins_change_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = crate::peer::test_peer_map(&dir).await;
+        pm.accounts = Arc::new(crate::accounts::Accounts::with_ids_by_admin("felix"));
+        let panel = Arc::new(Panel::new(pm, Default::default()).await.unwrap());
+        panel.pm.db.insert_peer("123456789", b"uuid-neu", b"pk", "").await.unwrap();
+        panel.pm.db.insert_peer("Kasse-PC", b"uuid-kasse", b"pk", "").await.unwrap();
+        let uuid = base64::encode(b"uuid-neu");
+        let heartbeat = || {
+            let body = json!({"id": "123456789", "uuid": uuid, "ver": 1001017, "modified_at": 0});
+            call(&panel, "POST", "/api/heartbeat", None, Some(body))
+        };
+
+        // A new device has no ID from an admin yet.
+        let res = json_of(heartbeat().await).await;
+        assert_eq!(res, json!({"simpledesk": {"id_assigned": false, "assigned_id": ""}}));
+
+        // Only an admin may change it; everybody else gets a 403 with the reason.
+        let admin = login(&panel, "felix").await;
+        let user = login(&panel, "anna").await;
+        let change = |new_id: &str| json!({"id": "123456789", "uuid": uuid, "new_id": new_id});
+        let path = "/api/simpledesk/change-id";
+        let res = call(&panel, "POST", path, Some(&user), Some(change("Rathaus-PC"))).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert!(json_of_any(res).await["error"].as_str().unwrap().contains("Nur Admins"));
+        let res = call(&panel, "POST", path, None, Some(change("Rathaus-PC"))).await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        for new_id in ["kasse-pc", "1-falsch", "zu-lang-fuer-eine-id"] {
+            let res = call(&panel, "POST", path, Some(&admin), Some(change(new_id))).await;
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "{new_id}");
+            assert!(json_of_any(res).await["error"].is_string());
+        }
+        let wrong = json!({"id": "123456789", "uuid": base64::encode(b"other"), "new_id": "Rathaus-PC"});
+        let res = call(&panel, "POST", path, Some(&admin), Some(wrong)).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert_eq!(json_of(heartbeat().await).await["simpledesk"]["id_assigned"], false);
+
+        // The admin's change reaches the device with its next heartbeat.
+        let res = call(&panel, "POST", path, Some(&admin), Some(change("Rathaus-PC"))).await;
+        assert_eq!(json_of(res).await, json!({}));
+        let res = json_of(heartbeat().await).await;
+        assert_eq!(res, json!({"simpledesk": {"id_assigned": true, "assigned_id": "Rathaus-PC"}}));
+
+        // A device that kept its ID gets that ID back.
+        let kasse = json!({"id": "Kasse-PC", "uuid": base64::encode(b"uuid-kasse"), "new_id": "Kasse-PC"});
+        let res = call(&panel, "POST", path, Some(&admin), Some(kasse)).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = json!({"id": "Kasse-PC", "uuid": base64::encode(b"uuid-kasse")});
+        let res = json_of(call(&panel, "POST", "/api/heartbeat", None, Some(body)).await).await;
+        assert_eq!(res["simpledesk"], json!({"id_assigned": true, "assigned_id": "Kasse-PC"}));
+    }
+
+    #[hbb_common::tokio::test]
     async fn server_info_names_the_key_without_login() {
         let dir = tempfile::tempdir().unwrap();
         let pm = crate::peer::test_peer_map(&dir).await;
@@ -928,9 +1120,18 @@ mod tests {
         let panel = test_panel(&dir).await;
         let body = json!({"id": "Felix-Work-PC", "uuid": "dXVpZA==", "ver": 1, "modified_at": 0});
         let res = call(&panel, "POST", "/api/heartbeat", None, Some(body)).await;
-        assert_eq!(json_of(res).await, json!({}));
-        let res = call(&panel, "POST", "/api/sysinfo", None, Some(json!({"id": "Felix-Work-PC"}))).await;
+        let quiet = json!({"simpledesk": {"id_assigned": true, "assigned_id": ""}});
+        assert_eq!(json_of(res).await, quiet);
+        // System info only for a registered device; the client tries again later.
+        let info = json!({"id": "Felix-Work-PC", "uuid": "dXVpZA==", "hostname": "BUERO-12", "os": "windows / Windows 11"});
+        let res = call(&panel, "POST", "/api/sysinfo", None, Some(info.clone())).await;
+        assert_eq!(text(res).await, "SYSINFO_LATER");
+        panel.pm.db.insert_peer("Felix-Work-PC", b"uuid", b"pk", "").await.unwrap();
+        let res = call(&panel, "POST", "/api/sysinfo", None, Some(info)).await;
         assert_eq!(text(res).await, "SYSINFO_UPDATED");
+        let devices = panel.pm.db.list_devices().await.unwrap();
+        let sysinfo: Value = serde_json::from_str(&devices[0].sysinfo).unwrap();
+        assert_eq!(sysinfo, json!({"hostname": "BUERO-12", "os": "windows / Windows 11"}));
         let res = call(&panel, "GET", "/api/peers?accessible&status=1", None, None).await;
         assert_eq!(json_of(res).await, json!({"total": 0, "data": []}));
         let res = call(&panel, "POST", "/api/audit/conn", None, Some(json!({}))).await;

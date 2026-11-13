@@ -160,8 +160,11 @@ impl Panel {
 
     /// The devices `user` may see: all for an admin, else the own ones and those of the
     /// user's groups. For an admin each device also gets the choices to assign it.
-    async fn devices(&self, user: &str) -> ResultType<Vec<Device>> {
+    /// With IDS_BY_ADMIN, devices without an ID from an admin are listed apart as new
+    /// devices, for admins only, and an old row of a device under another ID is left out.
+    async fn devices(&self, user: &str) -> ResultType<(Vec<Device>, Vec<NewDevice>)> {
         let admin = self.pm.accounts.is_admin(user);
+        let ids_by_admin = self.pm.accounts.ids_by_admin;
         let groups = self.pm.db.user_groups(user).await?;
         let (all_users, all_groups) = if admin {
             let users: Vec<String> = self.pm.db.list_users().await?.into_iter().map(|row| row.name).collect();
@@ -169,8 +172,37 @@ impl Panel {
         } else {
             Default::default()
         };
+        let rows = self.pm.db.list_devices().await?;
+        let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
         let mut devices = Vec::new();
-        for row in self.pm.db.list_devices().await? {
+        let mut new_devices = Vec::new();
+        for row in rows {
+            let sysinfo = serde_json::from_str::<serde_json::Value>(&row.sysinfo).unwrap_or_default();
+            let ip = serde_json::from_str::<serde_json::Value>(&row.info)
+                .ok()
+                .and_then(|info| info.get("ip").and_then(|ip| ip.as_str()).map(str::to_owned))
+                .unwrap_or_default();
+            if ids_by_admin {
+                match row.assigned_id.as_deref() {
+                    None => {
+                        if admin {
+                            let text = |key: &str| sysinfo.get(key).and_then(|value| value.as_str()).unwrap_or_default().to_owned();
+                            new_devices.push(NewDevice {
+                                id: row.id,
+                                hostname: text("hostname"),
+                                username: text("username"),
+                                os: text("os"),
+                                ip,
+                                first_seen: row.registered,
+                            });
+                        }
+                        continue;
+                    }
+                    // The device has another row under the ID it was given.
+                    Some(assigned) if assigned != row.id && ids.iter().any(|id| id == assigned) => continue,
+                    Some(_) => {}
+                }
+            }
             let visible = admin
                 || (!row.owner.is_empty() && row.owner == user)
                 || (!row.group.is_empty() && groups.contains(&row.group));
@@ -179,11 +211,13 @@ impl Panel {
             }
             let DeviceRow {
                 id,
-                info,
                 registered,
                 owner,
                 group,
+                assigned_id,
+                ..
             } = row;
+            let pending_id = assigned_id.filter(|assigned| *assigned != id).unwrap_or_default();
             let (owner_choices, group_choices) = if admin {
                 (
                     choices("niemand", &all_users, &owner),
@@ -192,10 +226,6 @@ impl Panel {
             } else {
                 Default::default()
             };
-            let ip = serde_json::from_str::<serde_json::Value>(&info)
-                .ok()
-                .and_then(|info| info.get("ip").and_then(|ip| ip.as_str()).map(str::to_owned))
-                .unwrap_or_default();
             let (online, websocket) = match self.pm.get_in_memory(&id).await {
                 Some(peer) => {
                     let peer = peer.read().await;
@@ -216,10 +246,22 @@ impl Panel {
                 group,
                 owner_choices,
                 group_choices,
+                pending_id,
             });
         }
-        Ok(devices)
+        Ok((devices, new_devices))
     }
+}
+
+/// A device that has no ID from an admin yet (IDS_BY_ADMIN).
+pub(crate) struct NewDevice {
+    /// The ID the device made up itself.
+    pub(crate) id: String,
+    pub(crate) hostname: String,
+    pub(crate) username: String,
+    pub(crate) os: String,
+    pub(crate) ip: String,
+    pub(crate) first_seen: String,
 }
 
 pub(crate) struct Device {
@@ -228,6 +270,8 @@ pub(crate) struct Device {
     pub(crate) websocket: bool,
     pub(crate) ip: String,
     pub(crate) registered: String,
+    /// The ID an admin gave the device that it has not taken yet, '' for none.
+    pub(crate) pending_id: String,
     /// User the device belongs to, '' for none.
     pub(crate) owner: String,
     /// Group the device belongs to, '' for none.
@@ -292,8 +336,18 @@ struct DevicesPage<'a> {
     admin: bool,
     active: &'a str,
     devices: &'a [Device],
+    /// For admins with IDS_BY_ADMIN: devices that wait for an ID.
+    new_devices: &'a [NewDevice],
+    ids_by_admin: bool,
     online: usize,
     error: &'a str,
+}
+
+#[derive(Deserialize)]
+struct SetIdForm {
+    id: String,
+    #[serde(default)]
+    new_id: String,
 }
 
 #[derive(Deserialize)]
@@ -518,6 +572,7 @@ pub(crate) fn router(panel: Arc<Panel>) -> Router {
         .route("/ab/rename", post(ab_rename))
         .route("/ab/remove", post(ab_remove))
         .route("/devices/assign", post(devices_assign))
+        .route("/devices/set-id", post(devices_set_id))
         .route("/users", get(users_page))
         .route("/users/signout", post(users_signout))
         .route("/users/block", post(users_block))
@@ -541,7 +596,7 @@ async fn index(Extension(panel): Extension<Arc<Panel>>, headers: HeaderMap) -> R
 }
 
 async fn render_devices(panel: &Panel, user: &str, status: StatusCode, error: &str) -> Response {
-    let devices = match panel.devices(user).await {
+    let (devices, new_devices) = match panel.devices(user).await {
         Ok(devices) => devices,
         Err(err) => {
             log::error!("SimpleDesk web panel: reading devices failed: {}", err);
@@ -557,11 +612,45 @@ async fn render_devices(panel: &Panel, user: &str, status: StatusCode, error: &s
             admin: panel.pm.accounts.is_admin(user),
             active: "devices",
             devices: &devices,
+            new_devices: &new_devices,
+            ids_by_admin: panel.pm.accounts.ids_by_admin,
             online,
             error,
         }
         .render(),
     )
+}
+
+/// Admins give a new device its ID ("ID vergeben") or change the ID of a device
+/// ("ID ändern"). The device takes it with its next heartbeat, a few seconds later.
+async fn devices_set_id(
+    Extension(panel): Extension<Arc<Panel>>,
+    headers: HeaderMap,
+    Form(form): Form<SetIdForm>,
+) -> Response {
+    let admin = match admin_of(&panel, &headers).await {
+        Ok(admin) => admin,
+        Err(res) => return res,
+    };
+    let id = form.id.trim();
+    let result: ResultType<Result<(), &str>> = async {
+        let Some(uuid) = panel.pm.db.device_uuid(id).await? else {
+            return Ok(Err("Dieses Gerät gibt es nicht."));
+        };
+        crate::api::assign_id(&panel.pm, id, &uuid, &form.new_id).await
+    }
+    .await;
+    match result {
+        Ok(Ok(())) => {
+            log::info!("SimpleDesk web panel: {} gave {} the ID {}", admin, id, form.new_id.trim());
+            redirect("/", None)
+        }
+        Ok(Err(error)) => render_devices(&panel, &admin, StatusCode::BAD_REQUEST, error).await,
+        Err(err) => {
+            log::error!("SimpleDesk web panel: saving an ID failed: {}", err);
+            render_devices(&panel, &admin, StatusCode::INTERNAL_SERVER_ERROR, "Speichern hat nicht geklappt.").await
+        }
+    }
 }
 
 /// The signed-in admin; everybody else gets the login or a refusal.
@@ -1682,6 +1771,43 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         let res = send(&panel, post_form_with("/ab/remove", &format!("book={personal}"), &carl)).await;
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[hbb_common::tokio::test]
+    async fn admins_give_new_devices_their_id_in_the_panel() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = crate::peer::test_peer_map(&dir).await;
+        pm.accounts = Arc::new(crate::accounts::Accounts::with_ids_by_admin("felix"));
+        let panel = Arc::new(Panel::new(pm, Default::default()).await.unwrap());
+        let db = &panel.pm.db;
+        db.insert_peer("123456789", b"uuid-neu", b"pk", r#"{"ip":"203.0.113.8"}"#).await.unwrap();
+        let info = r#"{"hostname":"BUERO-12","username":"anna","os":"windows / Windows 11"}"#;
+        assert!(db.save_device_info("123456789", b"uuid-neu", info).await.unwrap());
+        let felix = signed_in(&panel, "felix").await;
+        let anna = signed_in(&panel, "anna").await;
+
+        // The admin sees the new device with what it told about itself, others do not.
+        let page = body(send(&panel, get("/", Some(&felix))).await).await;
+        assert!(page.contains("Neue Geräte (ohne ID)") && page.contains("BUERO-12"), "{page}");
+        assert!(page.contains("windows / Windows 11") && page.contains("203.0.113.8"), "{page}");
+        assert!(!page.contains("<td class=\"id\">123456789"), "{page}");
+        let page = body(send(&panel, get("/", Some(&anna))).await).await;
+        assert!(!page.contains("Neue Geräte") && !page.contains("BUERO-12"), "{page}");
+
+        // Only admins give IDs, and only usable ones.
+        let res = send(&panel, post_form_with("/devices/set-id", "id=123456789&new_id=Rathaus-PC", &anna)).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let res = send(&panel, post_form_with("/devices/set-id", "id=123456789&new_id=1-falsch", &felix)).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(db.id_assignment(b"uuid-neu").await.unwrap(), None);
+
+        // "ID vergeben": the device is in the list and takes the new ID soon.
+        let res = send(&panel, post_form_with("/devices/set-id", "id=123456789&new_id=Rathaus-PC", &felix)).await;
+        assert_eq!(location(&res), "/");
+        assert_eq!(db.id_assignment(b"uuid-neu").await.unwrap().as_deref(), Some("Rathaus-PC"));
+        let page = body(send(&panel, get("/", Some(&felix))).await).await;
+        assert!(page.contains("<td class=\"id\">123456789<span class=\"pending\">wird zu Rathaus-PC</span>"), "{page}");
+        assert!(page.contains("ID ändern") && page.contains("Gerade wartet kein Gerät auf eine ID"), "{page}");
     }
 
     #[hbb_common::tokio::test]
