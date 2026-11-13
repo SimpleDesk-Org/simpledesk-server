@@ -544,6 +544,15 @@ mod tests {
         // The provider refused: no session.
         let res = call(&panel, "GET", "/oidc/callback?error=access_denied&state=x", None, None).await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // A blocked user gets no session, even with a good login at the provider.
+        panel.pm.db.set_blocked("felix", true).await.unwrap();
+        let authorize = location(&call(&panel, "GET", "/oidc/login", None, None).await);
+        let state = grant(&provider, &authorize, "code-4", "felix").await;
+        let res = call(&panel, "GET", &format!("/oidc/callback?code=code-4&state={state}"), None, None).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(res.headers().get(header::SET_COOKIE).is_none());
+        assert!(text(res).await.contains("gesperrt"));
     }
 
     #[hbb_common::tokio::test]
@@ -551,6 +560,8 @@ mod tests {
         let provider = test_provider::start().await;
         let dir = tempfile::tempdir().unwrap();
         let panel = panel_with_oidc(&dir, &provider.issuer).await;
+        // The device registered with the uuid it sends at the login ("dXVpZA==").
+        panel.pm.db.insert_peer("Felix-Work-PC", b"uuid", b"pk", "").await.unwrap();
 
         let options = json_of(call(&panel, "GET", "/api/login-options", None, None).await).await;
         assert_eq!(options, json!(["oidc/Eider"]));
@@ -581,6 +592,10 @@ mod tests {
         assert_eq!(done["type"], "access_token");
         assert_eq!(done["user"]["name"], "felix");
         assert_eq!(done["user"]["info"], json!({}));
+        assert_eq!(done["user"]["is_admin"], false);
+        // The device belongs to felix now.
+        let owner = panel.pm.db.device_owner("Felix-Work-PC").await.unwrap();
+        assert_eq!(owner, Some(("felix".to_owned(), String::new())));
         assert_eq!(call(&panel, "GET", &query_path, None, None).await.status(), StatusCode::BAD_REQUEST);
         let token = done["access_token"].as_str().unwrap();
         let req = Request::post("/api/currentUser")

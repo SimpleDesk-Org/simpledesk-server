@@ -107,3 +107,36 @@ td.id { font-weight: 600; }
 @media (max-width: 640px) {
   th:nth-child(5), td:nth-child(5) { display: none; }
 }
+.table-wrap { overflow-x: auto; }
+select {
+  padding: 6px 8px;
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent);
+  border-radius: 10px;
+}
+.badge.quiet { color: var(--muted); background: var(--bg); border: 1px solid var(--line); }
+.badge.danger { background: var(--error); }
+form.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0 6px 6px 0;
+  padding: 1px 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+form.inline { display: flex; align-items: flex-end; gap: 8px; flex-wrap: wrap; margin: 0; }
+form.inline label { margin: 0; }
+td.actions form + form { margin-top: 4px; }

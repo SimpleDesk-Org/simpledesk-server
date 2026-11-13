@@ -188,12 +188,31 @@ impl Database {
                 created_at datetime not null default(current_timestamp),
                 last_used datetime
             )",
+            // Groups of users; members may control the devices of their group.
+            "create table if not exists user_group (
+                name varchar(100) primary key not null collate nocase,
+                created_at datetime not null default(current_timestamp)
+            )",
+            "create table if not exists user_group_member (
+                grp varchar(100) not null,
+                user varchar(100) not null,
+                primary key (grp, user)
+            )",
+            // Who a device belongs to: a user and/or a group, '' for none. By guid, so a
+            // device keeps its owner when its ID changes.
+            "create table if not exists device_owner (
+                guid blob primary key not null,
+                owner varchar(100) not null default '',
+                grp varchar(100) not null default ''
+            )",
         ] {
             sqlx::query(statement)
                 .execute(self.pool.get().await?.deref_mut())
                 .await?;
         }
         self.add_column("api_token", "last_used", "datetime").await?;
+        self.add_column("panel_user", "last_login", "datetime").await?;
+        self.add_column("panel_user", "blocked", "integer not null default 0").await?;
         Ok(())
     }
 
@@ -230,7 +249,7 @@ impl Database {
         let mut conn = self.pool.get().await?;
         let user = sqlx::query_scalar::<_, String>(
             "select t.user from api_token t join panel_user u on u.name = t.user
-             where t.token_hash = ? and t.created_at > datetime('now', ?)",
+             where t.token_hash = ? and t.created_at > datetime('now', ?) and u.blocked = 0",
         )
         .bind(token_hash)
         .bind(format!("-{} days", max_age_days))
@@ -271,7 +290,7 @@ impl Database {
         let mut conn = self.pool.get().await?;
         let user = sqlx::query_scalar::<_, String>(
             "select s.user from panel_session s join panel_user u on u.name = s.user
-             where s.token_hash = ? and s.created_at > datetime('now', ?)",
+             where s.token_hash = ? and s.created_at > datetime('now', ?) and u.blocked = 0",
         )
         .bind(token_hash)
         .bind(format!("-{} hours", max_age_hours))
@@ -432,14 +451,232 @@ impl Database {
         Ok(())
     }
 
-    /// All registered devices as (id, info json, registered at), sorted by id.
-    pub async fn list_peers(&self) -> ResultType<Vec<(String, String, String)>> {
-        Ok(sqlx::query_as::<_, (String, String, String)>(
-            "select id, info, cast(created_at as text) from peer order by id collate nocase",
+    /// Notes a login through the provider.
+    pub async fn record_login(&self, name: &str) -> ResultType<()> {
+        sqlx::query("update panel_user set last_login = current_timestamp where name = ?")
+            .bind(name)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn is_blocked(&self, name: &str) -> ResultType<bool> {
+        Ok(sqlx::query_scalar::<_, i64>("select blocked from panel_user where name = ?")
+            .bind(name)
+            .fetch_optional(self.pool.get().await?.deref_mut())
+            .await?
+            .unwrap_or_default()
+            != 0)
+    }
+
+    pub async fn set_blocked(&self, name: &str, blocked: bool) -> ResultType<()> {
+        sqlx::query("update panel_user set blocked = ? where name = ?")
+            .bind(blocked as i64)
+            .bind(name)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
+    }
+
+    /// Ends every login of a user: all client tokens and panel sessions.
+    pub async fn delete_user_logins(&self, name: &str) -> ResultType<()> {
+        let mut conn = self.pool.get().await?;
+        for statement in [
+            "delete from api_token where user = ?",
+            "delete from panel_session where user = ?",
+        ] {
+            sqlx::query(statement)
+                .bind(name)
+                .execute(conn.deref_mut())
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Everybody who ever signed in, sorted by name.
+    pub async fn list_users(&self) -> ResultType<Vec<UserRow>> {
+        let rows = sqlx::query_as::<_, (String, String, i64, String, String)>(
+            "select u.name, coalesce(cast(u.last_login as text), ''), u.blocked,
+                coalesce((select cast(max(last_used) as text) from api_token where user = u.name), ''),
+                coalesce((select cast(max(last_used) as text) from panel_session where user = u.name), '')
+             from panel_user u order by u.name collate nocase",
+        )
+        .fetch_all(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(name, last_login, blocked, token_used, session_used)| UserRow {
+                name,
+                last_login,
+                blocked: blocked != 0,
+                last_active: token_used.max(session_used),
+            })
+            .collect())
+    }
+
+    pub async fn user_exists(&self, name: &str) -> ResultType<bool> {
+        Ok(sqlx::query_scalar::<_, String>("select name from panel_user where name = ?")
+            .bind(name)
+            .fetch_optional(self.pool.get().await?.deref_mut())
+            .await?
+            .is_some())
+    }
+
+    pub async fn list_groups(&self) -> ResultType<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>("select name from user_group order by name collate nocase")
+            .fetch_all(self.pool.get().await?.deref_mut())
+            .await?)
+    }
+
+    /// The stored spelling of a group, None if there is no such group.
+    pub async fn group_name(&self, name: &str) -> ResultType<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>("select name from user_group where name = ?")
+            .bind(name)
+            .fetch_optional(self.pool.get().await?.deref_mut())
+            .await?)
+    }
+
+    /// Creates a group; false if a group with that name (in any case) exists.
+    pub async fn create_group(&self, name: &str) -> ResultType<bool> {
+        let done = sqlx::query("insert or ignore into user_group(name) values(?)")
+            .bind(name)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// Deletes a group with its members; its devices keep their owner but lose the group.
+    pub async fn delete_group(&self, name: &str) -> ResultType<()> {
+        let mut conn = self.pool.get().await?;
+        for statement in [
+            "delete from user_group_member where grp = ?",
+            "update device_owner set grp = '' where grp = ?",
+            "delete from user_group where name = ?",
+        ] {
+            sqlx::query(statement)
+                .bind(name)
+                .execute(conn.deref_mut())
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn add_group_member(&self, group: &str, user: &str) -> ResultType<()> {
+        sqlx::query("insert or ignore into user_group_member(grp, user) values(?, ?)")
+            .bind(group)
+            .bind(user)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn remove_group_member(&self, group: &str, user: &str) -> ResultType<()> {
+        sqlx::query("delete from user_group_member where grp = ? and user = ?")
+            .bind(group)
+            .bind(user)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
+    }
+
+    /// All memberships as (group, user).
+    pub async fn list_group_members(&self) -> ResultType<Vec<(String, String)>> {
+        Ok(sqlx::query_as::<_, (String, String)>(
+            "select grp, user from user_group_member order by grp collate nocase, user collate nocase",
         )
         .fetch_all(self.pool.get().await?.deref_mut())
         .await?)
     }
+
+    /// The groups a user is a member of, sorted by name.
+    pub async fn user_groups(&self, user: &str) -> ResultType<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "select grp from user_group_member where user = ? order by grp collate nocase",
+        )
+        .bind(user)
+        .fetch_all(self.pool.get().await?.deref_mut())
+        .await?)
+    }
+
+    /// All registered devices with owner and group, sorted by id.
+    pub async fn list_devices(&self) -> ResultType<Vec<DeviceRow>> {
+        let rows = sqlx::query_as::<_, (String, String, String, String, String)>(
+            "select p.id, p.info, cast(p.created_at as text), coalesce(o.owner, ''), coalesce(o.grp, '')
+             from peer p left join device_owner o on o.guid = p.guid
+             order by p.id collate nocase",
+        )
+        .fetch_all(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, info, registered, owner, group)| DeviceRow {
+                id,
+                info,
+                registered,
+                owner,
+                group,
+            })
+            .collect())
+    }
+
+    /// Owner and group of a device, ('', '') without; None if there is no such device.
+    pub async fn device_owner(&self, id: &str) -> ResultType<Option<(String, String)>> {
+        Ok(sqlx::query_as::<_, (String, String)>(
+            "select coalesce(o.owner, ''), coalesce(o.grp, '')
+             from peer p left join device_owner o on o.guid = p.guid where p.id = ?",
+        )
+        .bind(id)
+        .fetch_optional(self.pool.get().await?.deref_mut())
+        .await?)
+    }
+
+    /// Gives a device an owner and a group ('' for none); false if there is no such device.
+    pub async fn assign_device(&self, id: &str, owner: &str, group: &str) -> ResultType<bool> {
+        let done = sqlx::query(
+            "insert into device_owner(guid, owner, grp) select guid, ?, ? from peer where id = ?
+             on conflict(guid) do update set owner = excluded.owner, grp = excluded.grp",
+        )
+        .bind(owner)
+        .bind(group)
+        .bind(id)
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// The user signed in on a device becomes its owner, if the device with this ID was
+    /// registered with this uuid. The group stays. False if no such device is registered.
+    pub async fn set_owner_from_login(&self, id: &str, uuid: &[u8], owner: &str) -> ResultType<bool> {
+        let done = sqlx::query(
+            "insert into device_owner(guid, owner) select guid, ? from peer where id = ? and uuid = ?
+             on conflict(guid) do update set owner = excluded.owner",
+        )
+        .bind(owner)
+        .bind(id)
+        .bind(uuid)
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+}
+
+/// A user of the panel list.
+pub struct UserRow {
+    pub name: String,
+    /// UTC, '' if never noted.
+    pub last_login: String,
+    pub blocked: bool,
+    /// Last use of a client token or panel session, UTC, '' if never noted.
+    pub last_active: String,
+}
+
+/// A registered device with its owner and group ('' for none).
+pub struct DeviceRow {
+    pub id: String,
+    pub info: String,
+    pub registered: String,
+    pub owner: String,
+    pub group: String,
 }
 
 #[cfg(test)]

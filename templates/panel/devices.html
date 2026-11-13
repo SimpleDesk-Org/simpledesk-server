@@ -4,13 +4,16 @@
 {% block content %}
 <section class="card">
   <h1>Geräte</h1>
-  <p class="hint">{% if devices.len() == 1 %}1 Gerät{% else %}{{ devices.len() }} Geräte{% endif %}, davon {{ online }} online.</p>
+  <p class="hint">{% if devices.len() == 1 %}1 Gerät{% else %}{{ devices.len() }} Geräte{% endif %}, davon {{ online }} online.
+  {% if admin %}Als Admin siehst und steuerst du alle Geräte. Gib einem Gerät einen Besitzer oder eine Gruppe, dann dürfen auch diese es steuern.{% else %}Du siehst deine Geräte und die Geräte deiner Gruppen.{% endif %}</p>
+  {% if !error.is_empty() %}<p class="error">{{ error }}</p>{% endif %}
   {% if devices.is_empty() %}
-  <p class="empty">Noch kein Gerät hat sich bei diesem Server angemeldet.</p>
+  <p class="empty">{% if admin %}Noch kein Gerät hat sich bei diesem Server angemeldet.{% else %}Dir gehört noch kein Gerät. Melde dich auf deinem Gerät in SimpleDesk an, dann gehört es dir.{% endif %}</p>
   {% else %}
+  <div class="table-wrap">
   <table>
     <thead>
-      <tr><th>ID</th><th>Status</th><th>Verbindung</th><th>IP</th><th>Angemeldet seit (UTC)</th></tr>
+      <tr><th>ID</th><th>Status</th><th>Verbindung</th><th>IP</th><th>Angemeldet seit (UTC)</th><th>Besitzer</th><th>Gruppe</th>{% if admin %}<th></th>{% endif %}</tr>
     </thead>
     <tbody>
       {% for device in devices %}
@@ -20,10 +23,24 @@
         <td>{% if device.online %}{% if device.websocket %}WebSocket (443){% else %}UDP{% endif %}{% else %}–{% endif %}</td>
         <td>{{ device.ip }}</td>
         <td>{{ device.registered }}</td>
+        {% if admin %}
+        <td><select name="owner" form="assign-{{ loop.index }}" aria-label="Besitzer von {{ device.id }}">{% for choice in device.owner_choices %}<option value="{{ choice.value }}"{% if choice.selected %} selected{% endif %}>{{ choice.label }}</option>{% endfor %}</select></td>
+        <td><select name="group" form="assign-{{ loop.index }}" aria-label="Gruppe von {{ device.id }}">{% for choice in device.group_choices %}<option value="{{ choice.value }}"{% if choice.selected %} selected{% endif %}>{{ choice.label }}</option>{% endfor %}</select></td>
+        <td class="actions">
+          <form id="assign-{{ loop.index }}" method="post" action="/devices/assign">
+            <input type="hidden" name="id" value="{{ device.id }}">
+            <button class="link" type="submit">Speichern</button>
+          </form>
+        </td>
+        {% else %}
+        <td>{% if device.owner.is_empty() %}–{% else %}{{ device.owner }}{% endif %}</td>
+        <td>{% if device.group.is_empty() %}–{% else %}{{ device.group }}{% endif %}</td>
+        {% endif %}
       </tr>
       {% endfor %}
     </tbody>
   </table>
+  </div>
   {% endif %}
 </section>
 {% endblock %}

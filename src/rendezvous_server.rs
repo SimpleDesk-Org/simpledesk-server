@@ -163,6 +163,8 @@ struct Inner {
 /// What a user who is not signed in sees when connecting (SimpleDesk, LOGIN_REQUIRED=Y).
 const LOGIN_REQUIRED_MESSAGE: &str =
     "Bitte melde dich in SimpleDesk an (Konto → Anmelden), dann kannst du dich verbinden.";
+/// What a signed-in user sees who may not control the device (SimpleDesk, LOGIN_REQUIRED=Y).
+const NOT_ALLOWED_MESSAGE: &str = "Du darfst dieses Gerät nicht steuern.";
 
 #[derive(Clone)]
 pub struct RendezvousServer {
@@ -567,12 +569,12 @@ impl RendezvousServer {
                         );
                         return false;
                     }
-                    // SimpleDesk: a relay only for signed-in users, see handle_punch_hole_request.
-                    if !self.signed_in(&rf.token).await {
-                        log::info!("Relay to {} from {} refused: not signed in", rf.id, addr);
+                    // SimpleDesk: a relay only for users who may control the device, see
+                    // handle_punch_hole_request.
+                    if let Some(reason) = self.refusal(&rf.token, &rf.id, addr).await {
                         let mut msg_out = RendezvousMessage::new();
                         msg_out.set_relay_response(RelayResponse {
-                            refuse_reason: LOGIN_REQUIRED_MESSAGE.to_owned(),
+                            refuse_reason: reason.to_owned(),
                             ..Default::default()
                         });
                         Self::send_to_sink(sink, msg_out).await;
@@ -838,10 +840,22 @@ impl RendezvousServer {
         true
     }
 
-    /// SimpleDesk: whether a connection request may go on. Always, unless LOGIN_REQUIRED=Y;
-    /// then only with the access token of a signed-in user.
-    async fn signed_in(&self, token: &str) -> bool {
-        !self.inner.login_required || crate::api::token_user(&self.pm, token).await.is_some()
+    /// SimpleDesk: why a connection request to device `id` may not go on, None if it may.
+    /// Always None unless LOGIN_REQUIRED=Y; then the access token must belong to a signed-in
+    /// user who may control the device (an admin, its owner or a member of its group).
+    async fn refusal(&self, token: &str, id: &str, from: SocketAddr) -> Option<&'static str> {
+        if !self.inner.login_required {
+            return None;
+        }
+        let Some(user) = crate::api::token_user(&self.pm, token).await else {
+            log::info!("Connection to {} from {} refused: not signed in", id, from);
+            return Some(LOGIN_REQUIRED_MESSAGE);
+        };
+        if crate::api::may_control(&self.pm, &user, id).await {
+            return None;
+        }
+        log::info!("Connection to {} from {} refused: {} may not control it", id, from, user);
+        Some(NOT_ALLOWED_MESSAGE)
     }
 
     /// SimpleDesk: the device echoed the heartbeat, so it is still online.
@@ -983,11 +997,10 @@ impl RendezvousServer {
             return Ok((msg_out, None));
         }
         // SimpleDesk: the client sends its access token with the request.
-        if !self.signed_in(&ph.token).await {
-            log::info!("Connection to {} from {} refused: not signed in", ph.id, addr);
+        if let Some(reason) = self.refusal(&ph.token, &ph.id, addr).await {
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
-                other_failure: LOGIN_REQUIRED_MESSAGE.to_owned(),
+                other_failure: reason.to_owned(),
                 ..Default::default()
             });
             return Ok((msg_out, None));
@@ -1879,18 +1892,31 @@ mod tests {
     /// punch_reqs_bounded counts it.
     static PUNCH_REQS_IN_USE: Lazy<TokioMutex<()>> = Lazy::new(|| TokioMutex::new(()));
 
+    /// A device that registered with this uuid and is online at `addr`.
+    async fn online_device(rs: &RendezvousServer, id: &str, uuid: &[u8], addr: &str) {
+        rs.pm.db.insert_peer(id, uuid, b"pk", "").await.unwrap();
+        let peer = rs.pm.get_or(id).await;
+        let mut peer = peer.write().await;
+        peer.last_reg_time = Instant::now();
+        peer.socket_addr = addr.parse().unwrap();
+    }
+
+    /// The access token of a signed-in user.
+    async fn token_of(rs: &RendezvousServer, user: &str) -> String {
+        rs.pm.db.ensure_external_user(user).await.unwrap();
+        let token = format!("token-of-{user}");
+        let hash = crate::api::token_hash(&token);
+        rs.pm.db.insert_api_token(&hash, user, "").await.unwrap();
+        token
+    }
+
     #[hbb_common::tokio::test]
     async fn login_required_lets_only_signed_in_users_connect() {
         let _punch_reqs = PUNCH_REQS_IN_USE.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let mut rs = test_server_with(&dir, true).await;
-        // An online device.
-        {
-            let peer = rs.pm.get_or("Felix-Home-PC").await;
-            let mut peer = peer.write().await;
-            peer.last_reg_time = Instant::now();
-            peer.socket_addr = "198.51.100.1:5000".parse().unwrap();
-        }
+        rs.pm.accounts = Arc::new(crate::accounts::Accounts::with_admins("felix"));
+        online_device(&rs, "Felix-Home-PC", b"uuid-home", "198.51.100.1:5000").await;
         let requester: SocketAddr = "203.0.113.9:4000".parse().unwrap();
         let request = |token: &str| PunchHoleRequest {
             id: "Felix-Home-PC".to_owned(),
@@ -1908,14 +1934,9 @@ mod tests {
             assert_eq!(msg.punch_hole_response().other_failure, LOGIN_REQUIRED_MESSAGE);
         }
 
-        // With the token of a signed-in user the request goes to the device.
-        rs.pm.db.ensure_external_user("felix").await.unwrap();
-        let token = "token-of-felix";
-        rs.pm
-            .db
-            .insert_api_token(&crate::api::token_hash(token), "felix", "Felix-Work-PC")
-            .await
-            .unwrap();
+        // With the token of a signed-in admin the request goes to the device.
+        let token = token_of(&rs, "felix").await;
+        let token = token.as_str();
         let (msg, to) = rs
             .handle_punch_hole_request(requester, request(token), "", true)
             .await
@@ -1932,6 +1953,85 @@ mod tests {
             .unwrap();
         assert!(to.is_none());
         assert_eq!(msg.punch_hole_response().other_failure, LOGIN_REQUIRED_MESSAGE);
+    }
+
+    #[hbb_common::tokio::test]
+    async fn only_admins_owners_and_group_members_may_connect() {
+        let _punch_reqs = PUNCH_REQS_IN_USE.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut rs = test_server_with(&dir, true).await;
+        rs.pm.accounts = Arc::new(crate::accounts::Accounts::with_admins("Felix"));
+        online_device(&rs, "Anna-PC", b"uuid-anna", "198.51.100.2:5000").await;
+        online_device(&rs, "Lager-PC", b"uuid-lager", "198.51.100.3:5000").await;
+        let requester: SocketAddr = "203.0.113.9:4000".parse().unwrap();
+        let felix = token_of(&rs, "felix").await;
+        let anna = token_of(&rs, "anna").await;
+        let ben = token_of(&rs, "ben").await;
+        let carl = token_of(&rs, "carl").await;
+        let db = rs.pm.db.clone();
+
+        // Without owner: only the admin. Not even the existence of the ID is told.
+        assert_eq!(rs.refusal(&felix, "Anna-PC", requester).await, None);
+        for (token, id) in [(&anna, "Anna-PC"), (&carl, "Lager-PC"), (&carl, "Nicht-Da")] {
+            assert_eq!(rs.refusal(token, id, requester).await, Some(NOT_ALLOWED_MESSAGE));
+        }
+        let (msg, to) = rs
+            .handle_punch_hole_request(
+                requester,
+                PunchHoleRequest {
+                    id: "Anna-PC".to_owned(),
+                    token: anna.clone(),
+                    ..Default::default()
+                },
+                "",
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(to.is_none());
+        assert_eq!(msg.punch_hole_response().other_failure, NOT_ALLOWED_MESSAGE);
+
+        // The owner and the members of the device's group, nobody else.
+        assert!(db.assign_device("Anna-PC", "anna", "").await.unwrap());
+        assert!(db.create_group("Lager").await.unwrap());
+        db.add_group_member("Lager", "ben").await.unwrap();
+        assert!(db.assign_device("Lager-PC", "", "Lager").await.unwrap());
+        assert_eq!(rs.refusal(&anna, "Anna-PC", requester).await, None);
+        assert_eq!(rs.refusal(&ben, "Lager-PC", requester).await, None);
+        assert_eq!(rs.refusal(&felix, "Lager-PC", requester).await, None);
+        for (token, id) in [(&ben, "Anna-PC"), (&anna, "Lager-PC"), (&carl, "Anna-PC"), (&carl, "Lager-PC")] {
+            assert_eq!(rs.refusal(token, id, requester).await, Some(NOT_ALLOWED_MESSAGE));
+        }
+        let (_, to) = rs
+            .handle_punch_hole_request(
+                requester,
+                PunchHoleRequest {
+                    id: "Lager-PC".to_owned(),
+                    token: ben.clone(),
+                    ..Default::default()
+                },
+                "",
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(to, Some("198.51.100.3:5000".parse().unwrap()));
+
+        // A blocked user is not signed in any more; a removed member loses the group.
+        db.set_blocked("anna", true).await.unwrap();
+        assert_eq!(rs.refusal(&anna, "Anna-PC", requester).await, Some(LOGIN_REQUIRED_MESSAGE));
+        db.remove_group_member("Lager", "ben").await.unwrap();
+        assert_eq!(rs.refusal(&ben, "Lager-PC", requester).await, Some(NOT_ALLOWED_MESSAGE));
+
+        // The owner stays when the device changes its ID.
+        db.set_blocked("anna", false).await.unwrap();
+        let peer = rs.pm.get("Anna-PC").await.unwrap();
+        assert_eq!(rs.pm.change_id(peer, "Anna-PC", "Anna-Laptop").await, register_pk_response::Result::OK);
+        assert_eq!(rs.refusal(&anna, "Anna-Laptop", requester).await, None);
+
+        // Without LOGIN_REQUIRED nothing is checked, as before.
+        let open = test_server_with(&dir, false).await;
+        assert_eq!(open.refusal("", "Lager-PC", requester).await, None);
     }
 
     async fn serve_one(rs: &RendezvousServer, ws: bool) -> SocketAddr {

@@ -1,4 +1,5 @@
-//! SimpleDesk web panel inside hbbs: login, the device list and the address book.
+//! SimpleDesk web panel inside hbbs: login, the device list and the address book, and for
+//! admins (ADMIN_USERS) the users, groups and owners of devices.
 //!
 //! It listens on the API port (port - 2, normally 21114) next to the WebSocket port, so the
 //! reverse proxy can serve it on port 443. There are no accounts with a password here: everybody
@@ -6,6 +7,7 @@
 
 use crate::common::get_arg;
 use crate::oidc::{Oidc, OidcConfig, Purpose};
+use crate::database::DeviceRow;
 use crate::peer::PeerMap;
 use crate::rendezvous_server::{TcpPeers, REG_TIMEOUT};
 use askama::Template;
@@ -146,9 +148,40 @@ impl Panel {
         Ok(entries)
     }
 
-    async fn devices(&self) -> ResultType<Vec<Device>> {
+    /// The devices `user` may see: all for an admin, else the own ones and those of the
+    /// user's groups. For an admin each device also gets the choices to assign it.
+    async fn devices(&self, user: &str) -> ResultType<Vec<Device>> {
+        let admin = self.pm.accounts.is_admin(user);
+        let groups = self.pm.db.user_groups(user).await?;
+        let (all_users, all_groups) = if admin {
+            let users: Vec<String> = self.pm.db.list_users().await?.into_iter().map(|row| row.name).collect();
+            (users, self.pm.db.list_groups().await?)
+        } else {
+            Default::default()
+        };
         let mut devices = Vec::new();
-        for (id, info, registered) in self.pm.db.list_peers().await? {
+        for row in self.pm.db.list_devices().await? {
+            let visible = admin
+                || (!row.owner.is_empty() && row.owner == user)
+                || (!row.group.is_empty() && groups.contains(&row.group));
+            if !visible {
+                continue;
+            }
+            let DeviceRow {
+                id,
+                info,
+                registered,
+                owner,
+                group,
+            } = row;
+            let (owner_choices, group_choices) = if admin {
+                (
+                    choices("niemand", &all_users, &owner),
+                    choices("keine", &all_groups, &group),
+                )
+            } else {
+                Default::default()
+            };
             let ip = serde_json::from_str::<serde_json::Value>(&info)
                 .ok()
                 .and_then(|info| info.get("ip").and_then(|ip| ip.as_str()).map(str::to_owned))
@@ -169,6 +202,10 @@ impl Panel {
                 websocket,
                 ip,
                 registered,
+                owner,
+                group,
+                owner_choices,
+                group_choices,
             });
         }
         Ok(devices)
@@ -181,6 +218,35 @@ pub(crate) struct Device {
     pub(crate) websocket: bool,
     pub(crate) ip: String,
     pub(crate) registered: String,
+    /// User the device belongs to, '' for none.
+    pub(crate) owner: String,
+    /// Group the device belongs to, '' for none.
+    pub(crate) group: String,
+    /// For admins: the options of the owner and group fields.
+    pub(crate) owner_choices: Vec<Choice>,
+    pub(crate) group_choices: Vec<Choice>,
+}
+
+/// An option of a select field.
+pub(crate) struct Choice {
+    pub(crate) value: String,
+    pub(crate) label: String,
+    pub(crate) selected: bool,
+}
+
+/// The options for picking one of `names` or none (`none` is the label for '').
+fn choices(none: &str, names: &[String], current: &str) -> Vec<Choice> {
+    let mut list = vec![Choice {
+        value: String::new(),
+        label: format!("– {} –", none),
+        selected: current.is_empty(),
+    }];
+    list.extend(names.iter().map(|name| Choice {
+        value: name.clone(),
+        label: name.clone(),
+        selected: name == current,
+    }));
+    list
 }
 
 #[derive(Template)]
@@ -213,9 +279,62 @@ struct CallbackQuery {
 #[template(path = "panel/devices.html")]
 struct DevicesPage<'a> {
     user: &'a str,
+    admin: bool,
     active: &'a str,
     devices: &'a [Device],
     online: usize,
+    error: &'a str,
+}
+
+#[derive(Deserialize)]
+struct AssignForm {
+    id: String,
+    #[serde(default)]
+    owner: String,
+    #[serde(default)]
+    group: String,
+}
+
+/// A user on the page "Benutzer".
+pub(crate) struct UserView {
+    pub(crate) name: String,
+    pub(crate) admin: bool,
+    pub(crate) blocked: bool,
+    /// The user's own row: no "Sperren".
+    pub(crate) me: bool,
+    pub(crate) groups: Vec<String>,
+    /// Groups the user is not in yet, for "hinzufügen".
+    pub(crate) other_groups: Vec<String>,
+    pub(crate) last_login: String,
+    pub(crate) last_active: String,
+}
+
+pub(crate) struct GroupView {
+    pub(crate) name: String,
+    pub(crate) members: usize,
+}
+
+#[derive(Template)]
+#[template(path = "panel/users.html")]
+struct UsersPage<'a> {
+    user: &'a str,
+    admin: bool,
+    active: &'a str,
+    oidc_name: &'a str,
+    users: &'a [UserView],
+    groups: &'a [GroupView],
+    error: &'a str,
+}
+
+#[derive(Deserialize)]
+struct NameForm {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct MemberForm {
+    user: String,
+    group: String,
 }
 
 pub(crate) struct AbEntry {
@@ -229,6 +348,7 @@ pub(crate) struct AbEntry {
 #[template(path = "panel/ab.html")]
 struct AbPage<'a> {
     user: &'a str,
+    admin: bool,
     active: &'a str,
     entries: &'a [AbEntry],
     error: &'a str,
@@ -289,6 +409,15 @@ pub(crate) fn router(panel: Arc<Panel>) -> Router {
         .route("/ab", get(ab_page))
         .route("/ab/add", post(ab_add))
         .route("/ab/delete", post(ab_delete))
+        .route("/devices/assign", post(devices_assign))
+        .route("/users", get(users_page))
+        .route("/users/signout", post(users_signout))
+        .route("/users/block", post(users_block))
+        .route("/users/unblock", post(users_unblock))
+        .route("/groups/new", post(groups_new))
+        .route("/groups/delete", post(groups_delete))
+        .route("/groups/join", post(groups_join))
+        .route("/groups/leave", post(groups_leave))
         .route("/oidc/login", get(oidc_login))
         .route("/oidc/callback", get(oidc_callback))
         .route("/panel.css", get(css))
@@ -300,7 +429,11 @@ async fn index(Extension(panel): Extension<Arc<Panel>>, headers: HeaderMap) -> R
     let Some(user) = panel.user(&headers).await else {
         return redirect("/login", None);
     };
-    let devices = match panel.devices().await {
+    render_devices(&panel, &user, StatusCode::OK, "").await
+}
+
+async fn render_devices(panel: &Panel, user: &str, status: StatusCode, error: &str) -> Response {
+    let devices = match panel.devices(user).await {
         Ok(devices) => devices,
         Err(err) => {
             log::error!("SimpleDesk web panel: reading devices failed: {}", err);
@@ -310,15 +443,296 @@ async fn index(Extension(panel): Extension<Arc<Panel>>, headers: HeaderMap) -> R
     };
     let online = devices.iter().filter(|device| device.online).count();
     html(
-        StatusCode::OK,
+        status,
         DevicesPage {
-            user: &user,
+            user,
+            admin: panel.pm.accounts.is_admin(user),
             active: "devices",
             devices: &devices,
             online,
+            error,
         }
         .render(),
     )
+}
+
+/// The signed-in admin; everybody else gets the login or a refusal.
+async fn admin_of(panel: &Panel, headers: &HeaderMap) -> Result<String, Response> {
+    let Some(user) = panel.user(headers).await else {
+        return Err(redirect("/login", None));
+    };
+    if !panel.pm.accounts.is_admin(&user) {
+        let page = Html("<p>Das dürfen nur Admins. <a href=\"/\">Zurück zu den Geräten</a></p>");
+        return Err((StatusCode::FORBIDDEN, page).into_response());
+    }
+    Ok(user)
+}
+
+/// Admins give a device an owner and a group.
+async fn devices_assign(
+    Extension(panel): Extension<Arc<Panel>>,
+    headers: HeaderMap,
+    Form(form): Form<AssignForm>,
+) -> Response {
+    let admin = match admin_of(&panel, &headers).await {
+        Ok(admin) => admin,
+        Err(res) => return res,
+    };
+    let db = &panel.pm.db;
+    let result: ResultType<Result<(), &str>> = async {
+        let owner = form.owner.trim();
+        if !owner.is_empty() && !db.user_exists(owner).await? {
+            return Ok(Err("Diesen Benutzer gibt es nicht."));
+        }
+        let group = match form.group.trim() {
+            "" => String::new(),
+            group => match db.group_name(group).await? {
+                Some(group) => group,
+                None => return Ok(Err("Diese Gruppe gibt es nicht.")),
+            },
+        };
+        if !db.assign_device(form.id.trim(), owner, &group).await? {
+            return Ok(Err("Dieses Gerät gibt es nicht."));
+        }
+        log::info!(
+            "SimpleDesk web panel: {} gave {} to owner '{}' and group '{}'",
+            admin,
+            form.id.trim(),
+            owner,
+            group
+        );
+        Ok(Ok(()))
+    }
+    .await;
+    match result {
+        Ok(Ok(())) => redirect("/", None),
+        Ok(Err(error)) => render_devices(&panel, &admin, StatusCode::BAD_REQUEST, error).await,
+        Err(err) => {
+            log::error!("SimpleDesk web panel: assigning a device failed: {}", err);
+            render_devices(&panel, &admin, StatusCode::INTERNAL_SERVER_ERROR, "Speichern hat nicht geklappt.").await
+        }
+    }
+}
+
+async fn render_users(panel: &Panel, me: &str, status: StatusCode, error: &str) -> Response {
+    let result: ResultType<(Vec<UserView>, Vec<GroupView>)> = async {
+        let db = &panel.pm.db;
+        let groups = db.list_groups().await?;
+        let members = db.list_group_members().await?;
+        let users = db
+            .list_users()
+            .await?
+            .into_iter()
+            .map(|row| {
+                let mine: Vec<String> = members
+                    .iter()
+                    .filter(|(_, user)| *user == row.name)
+                    .map(|(group, _)| group.clone())
+                    .collect();
+                UserView {
+                    admin: panel.pm.accounts.is_admin(&row.name),
+                    me: row.name == me,
+                    other_groups: groups.iter().filter(|group| !mine.contains(group)).cloned().collect(),
+                    groups: mine,
+                    name: row.name,
+                    blocked: row.blocked,
+                    last_login: row.last_login,
+                    last_active: row.last_active,
+                }
+            })
+            .collect();
+        let groups = groups
+            .into_iter()
+            .map(|name| GroupView {
+                members: members.iter().filter(|(group, _)| *group == name).count(),
+                name,
+            })
+            .collect();
+        Ok((users, groups))
+    }
+    .await;
+    match result {
+        Ok((users, groups)) => html(
+            status,
+            UsersPage {
+                user: me,
+                admin: true,
+                active: "users",
+                oidc_name: panel.oidc_name(),
+                users: &users,
+                groups: &groups,
+                error,
+            }
+            .render(),
+        ),
+        Err(err) => {
+            log::error!("SimpleDesk web panel: reading users failed: {}", err);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Benutzer konnten nicht gelesen werden.").into_response()
+        }
+    }
+}
+
+async fn users_page(Extension(panel): Extension<Arc<Panel>>, headers: HeaderMap) -> Response {
+    match admin_of(&panel, &headers).await {
+        Ok(admin) => render_users(&panel, &admin, StatusCode::OK, "").await,
+        Err(res) => res,
+    }
+}
+
+/// The end of an action on the page "Benutzer": back to the page, or the page with the error.
+async fn users_done(panel: &Panel, admin: &str, result: ResultType<Result<(), &str>>) -> Response {
+    match result {
+        Ok(Ok(())) => redirect("/users", None),
+        Ok(Err(error)) => render_users(panel, admin, StatusCode::BAD_REQUEST, error).await,
+        Err(err) => {
+            log::error!("SimpleDesk web panel: changing users failed: {}", err);
+            render_users(panel, admin, StatusCode::INTERNAL_SERVER_ERROR, "Speichern hat nicht geklappt.").await
+        }
+    }
+}
+
+/// "Abmelden": ends all logins of the user in clients and in the panel.
+async fn users_signout(
+    Extension(panel): Extension<Arc<Panel>>,
+    headers: HeaderMap,
+    Form(form): Form<NameForm>,
+) -> Response {
+    let admin = match admin_of(&panel, &headers).await {
+        Ok(admin) => admin,
+        Err(res) => return res,
+    };
+    let result: ResultType<Result<(), &str>> = async {
+        panel.pm.db.delete_user_logins(&form.name).await?;
+        log::info!("SimpleDesk web panel: {} signed out {} everywhere", admin, form.name);
+        Ok(Ok(()))
+    }
+    .await;
+    users_done(&panel, &admin, result).await
+}
+
+/// "Sperren": the user cannot sign in any more and loses all logins. Not for admins, they
+/// come from ADMIN_USERS.
+async fn users_block(
+    Extension(panel): Extension<Arc<Panel>>,
+    headers: HeaderMap,
+    Form(form): Form<NameForm>,
+) -> Response {
+    let admin = match admin_of(&panel, &headers).await {
+        Ok(admin) => admin,
+        Err(res) => return res,
+    };
+    let result: ResultType<Result<(), &str>> = async {
+        if panel.pm.accounts.is_admin(&form.name) {
+            return Ok(Err("Admins kann man nicht sperren. Nimm sie erst aus ADMIN_USERS heraus."));
+        }
+        let db = &panel.pm.db;
+        db.set_blocked(&form.name, true).await?;
+        db.delete_user_logins(&form.name).await?;
+        log::info!("SimpleDesk web panel: {} blocked {}", admin, form.name);
+        Ok(Ok(()))
+    }
+    .await;
+    users_done(&panel, &admin, result).await
+}
+
+async fn users_unblock(
+    Extension(panel): Extension<Arc<Panel>>,
+    headers: HeaderMap,
+    Form(form): Form<NameForm>,
+) -> Response {
+    let admin = match admin_of(&panel, &headers).await {
+        Ok(admin) => admin,
+        Err(res) => return res,
+    };
+    let result: ResultType<Result<(), &str>> = async {
+        panel.pm.db.set_blocked(&form.name, false).await?;
+        log::info!("SimpleDesk web panel: {} unblocked {}", admin, form.name);
+        Ok(Ok(()))
+    }
+    .await;
+    users_done(&panel, &admin, result).await
+}
+
+async fn groups_new(
+    Extension(panel): Extension<Arc<Panel>>,
+    headers: HeaderMap,
+    Form(form): Form<NameForm>,
+) -> Response {
+    let admin = match admin_of(&panel, &headers).await {
+        Ok(admin) => admin,
+        Err(res) => return res,
+    };
+    let result: ResultType<Result<(), &str>> = async {
+        let name = form.name.trim();
+        if name.is_empty() || name.chars().count() > 100 {
+            return Ok(Err("Bitte einen Namen für die Gruppe eingeben (höchstens 100 Zeichen)."));
+        }
+        if !panel.pm.db.create_group(name).await? {
+            return Ok(Err("Diese Gruppe gibt es schon."));
+        }
+        Ok(Ok(()))
+    }
+    .await;
+    users_done(&panel, &admin, result).await
+}
+
+async fn groups_delete(
+    Extension(panel): Extension<Arc<Panel>>,
+    headers: HeaderMap,
+    Form(form): Form<NameForm>,
+) -> Response {
+    let admin = match admin_of(&panel, &headers).await {
+        Ok(admin) => admin,
+        Err(res) => return res,
+    };
+    let result: ResultType<Result<(), &str>> = async {
+        panel.pm.db.delete_group(&form.name).await?;
+        log::info!("SimpleDesk web panel: {} deleted the group {}", admin, form.name);
+        Ok(Ok(()))
+    }
+    .await;
+    users_done(&panel, &admin, result).await
+}
+
+async fn groups_join(
+    Extension(panel): Extension<Arc<Panel>>,
+    headers: HeaderMap,
+    Form(form): Form<MemberForm>,
+) -> Response {
+    let admin = match admin_of(&panel, &headers).await {
+        Ok(admin) => admin,
+        Err(res) => return res,
+    };
+    let result: ResultType<Result<(), &str>> = async {
+        let db = &panel.pm.db;
+        let Some(group) = db.group_name(&form.group).await? else {
+            return Ok(Err("Diese Gruppe gibt es nicht."));
+        };
+        if !db.user_exists(&form.user).await? {
+            return Ok(Err("Diesen Benutzer gibt es nicht."));
+        }
+        db.add_group_member(&group, &form.user).await?;
+        Ok(Ok(()))
+    }
+    .await;
+    users_done(&panel, &admin, result).await
+}
+
+async fn groups_leave(
+    Extension(panel): Extension<Arc<Panel>>,
+    headers: HeaderMap,
+    Form(form): Form<MemberForm>,
+) -> Response {
+    let admin = match admin_of(&panel, &headers).await {
+        Ok(admin) => admin,
+        Err(res) => return res,
+    };
+    let result: ResultType<Result<(), &str>> = async {
+        panel.pm.db.remove_group_member(&form.group, &form.user).await?;
+        Ok(Ok(()))
+    }
+    .await;
+    users_done(&panel, &admin, result).await
 }
 
 async fn render_ab(panel: &Panel, user: &str, status: StatusCode, error: &str) -> Response {
@@ -327,6 +741,7 @@ async fn render_ab(panel: &Panel, user: &str, status: StatusCode, error: &str) -
             status,
             AbPage {
                 user,
+                admin: panel.pm.accounts.is_admin(user),
                 active: "ab",
                 entries: &entries,
                 error,
@@ -467,9 +882,26 @@ async fn oidc_callback(
         }
     };
     // An account from the provider has no password of its own here.
-    if let Err(err) = panel.pm.db.ensure_external_user(&user).await {
-        log::error!("SimpleDesk OIDC: saving user {} failed: {}", user, err);
-        return oidc_done(false, "Fehler beim Speichern.");
+    let saved: ResultType<bool> = async {
+        let db = &panel.pm.db;
+        db.ensure_external_user(&user).await?;
+        if db.is_blocked(&user).await? {
+            return Ok(false);
+        }
+        db.record_login(&user).await?;
+        Ok(true)
+    }
+    .await;
+    match saved {
+        Ok(true) => {}
+        Ok(false) => {
+            log::warn!("SimpleDesk OIDC: {} is blocked and may not sign in", user);
+            return oidc_done(false, "Dein Konto ist für SimpleDesk gesperrt. Bitte wende dich an die IT.");
+        }
+        Err(err) => {
+            log::error!("SimpleDesk OIDC: saving user {} failed: {}", user, err);
+            return oidc_done(false, "Fehler beim Speichern.");
+        }
     }
     match purpose {
         Purpose::Panel => match panel.start_session(&user).await {
@@ -588,8 +1020,10 @@ mod tests {
     use hbb_common::tokio;
     use tower::ServiceExt;
 
+    /// A panel where felix is the admin.
     async fn test_panel(dir: &tempfile::TempDir) -> Arc<Panel> {
-        let pm = crate::peer::test_peer_map(dir).await;
+        let mut pm = crate::peer::test_peer_map(dir).await;
+        pm.accounts = Arc::new(crate::accounts::Accounts::with_admins("felix"));
         Arc::new(Panel::new(pm, Default::default()).await.unwrap())
     }
 
@@ -708,6 +1142,123 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         send(&panel, with_cookie(post_form("/ab/delete", "id=Felix-Home-PC"))).await;
         assert!(panel.pm.db.list_ab_peers(&guid).await.unwrap().is_empty());
+    }
+
+    fn post_form_with(path: &str, form: &str, cookie: &str) -> Request<Body> {
+        let mut req = post_form(path, form);
+        req.headers_mut()
+            .insert(header::COOKIE, HeaderValue::from_str(cookie).unwrap());
+        req
+    }
+
+    #[hbb_common::tokio::test]
+    async fn users_page_is_for_admins_and_signs_out_and_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = test_panel(&dir).await;
+        let db = &panel.pm.db;
+        let felix = signed_in(&panel, "felix").await;
+        let anna = signed_in(&panel, "anna").await;
+
+        // Only admins see the page and its actions; the nav shows it only to them.
+        assert!(body(send(&panel, get("/", Some(&felix))).await).await.contains("href=\"/users\""));
+        assert!(!body(send(&panel, get("/", Some(&anna))).await).await.contains("href=\"/users\""));
+        assert_eq!(send(&panel, get("/users", Some(&anna))).await.status(), StatusCode::FORBIDDEN);
+        let res = send(&panel, post_form_with("/users/block", "name=felix", &anna)).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert_eq!(location(&send(&panel, get("/users", None)).await), "/login");
+        let page = body(send(&panel, get("/users", Some(&felix))).await).await;
+        assert!(page.contains("anna") && page.contains("Admin") && page.contains("Benutzer"), "{page}");
+
+        // "Abmelden" ends the client tokens and panel sessions of anna.
+        db.insert_api_token(&token_hash("token-of-anna"), "anna", "Anna-PC").await.unwrap();
+        let res = send(&panel, post_form_with("/users/signout", "name=anna", &felix)).await;
+        assert_eq!(location(&res), "/users");
+        assert_eq!(crate::api::token_user(&panel.pm, "token-of-anna").await, None);
+        assert_eq!(location(&send(&panel, get("/", Some(&anna))).await), "/login");
+
+        // "Sperren" does the same, and anna stays out until "Entsperren".
+        let anna = signed_in(&panel, "anna").await;
+        db.insert_api_token(&token_hash("token-of-anna"), "anna", "Anna-PC").await.unwrap();
+        send(&panel, post_form_with("/users/block", "name=anna", &felix)).await;
+        assert!(db.is_blocked("anna").await.unwrap());
+        assert_eq!(crate::api::token_user(&panel.pm, "token-of-anna").await, None);
+        assert_eq!(location(&send(&panel, get("/", Some(&anna))).await), "/login");
+        let anna = format!("{}={}", COOKIE_NAME, panel.start_session("anna").await.unwrap());
+        assert_eq!(location(&send(&panel, get("/", Some(&anna))).await), "/login");
+        let page = body(send(&panel, get("/users", Some(&felix))).await).await;
+        assert!(page.contains("gesperrt") && page.contains("Entsperren"), "{page}");
+        send(&panel, post_form_with("/users/unblock", "name=anna", &felix)).await;
+        assert!(!db.is_blocked("anna").await.unwrap());
+
+        // Admins cannot be blocked: they come from ADMIN_USERS.
+        let res = send(&panel, post_form_with("/users/block", "name=FELIX", &felix)).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(body(res).await.contains("Admins kann man nicht sperren"));
+        assert!(!db.is_blocked("felix").await.unwrap());
+    }
+
+    #[hbb_common::tokio::test]
+    async fn owners_and_groups_decide_who_sees_a_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = test_panel(&dir).await;
+        let db = &panel.pm.db;
+        for id in ["Anna-PC", "Lager-PC", "Frei-PC"] {
+            db.insert_peer(id, id.as_bytes(), b"pk", "{}").await.unwrap();
+        }
+        let felix = signed_in(&panel, "felix").await;
+        let anna = signed_in(&panel, "anna").await;
+        let ben = signed_in(&panel, "ben").await;
+        let sees = |cookie: String| {
+            let panel = panel.clone();
+            async move {
+                let page = body(send(&panel, get("/", Some(&cookie))).await).await;
+                ["Anna-PC", "Lager-PC", "Frei-PC"]
+                    .into_iter()
+                    .filter(|id| page.contains(&format!("<td class=\"id\">{id}</td>")))
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        // Groups: created once, in any case.
+        let res = send(&panel, post_form_with("/groups/new", "name=Lager", &felix)).await;
+        assert_eq!(location(&res), "/users");
+        let res = send(&panel, post_form_with("/groups/new", "name=lager", &felix)).await;
+        assert!(body(res).await.contains("gibt es schon"));
+        send(&panel, post_form_with("/groups/join", "user=ben&group=lager", &felix)).await;
+        assert_eq!(db.user_groups("ben").await.unwrap(), vec!["Lager"]);
+        let res = send(&panel, post_form_with("/groups/join", "user=niemand&group=Lager", &felix)).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // Before anything is assigned only the admin sees devices.
+        assert_eq!(sees(felix.clone()).await, vec!["Anna-PC", "Lager-PC", "Frei-PC"]);
+        assert!(sees(anna.clone()).await.is_empty());
+        assert!(body(send(&panel, get("/", Some(&anna))).await).await.contains("Dir gehört noch kein Gerät"));
+
+        // The admin assigns an owner and a group.
+        let res = send(&panel, post_form_with("/devices/assign", "id=Anna-PC&owner=anna&group=", &felix)).await;
+        assert_eq!(location(&res), "/");
+        send(&panel, post_form_with("/devices/assign", "id=Lager-PC&owner=&group=Lager", &felix)).await;
+        assert_eq!(sees(anna.clone()).await, vec!["Anna-PC"]);
+        assert_eq!(sees(ben.clone()).await, vec!["Lager-PC"]);
+        let page = body(send(&panel, get("/", Some(&felix))).await).await;
+        assert!(page.contains("<option value=\"anna\" selected>anna</option>"), "{page}");
+
+        // Only admins assign, and only to users and groups that exist.
+        let res = send(&panel, post_form_with("/devices/assign", "id=Frei-PC&owner=anna&group=", &anna)).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        for form in ["id=Frei-PC&owner=niemand&group=", "id=Frei-PC&owner=&group=Keine", "id=Nicht-Da&owner=anna&group="] {
+            let res = send(&panel, post_form_with("/devices/assign", form, &felix)).await;
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{form}");
+        }
+        assert!(sees(anna.clone()).await == vec!["Anna-PC"]);
+
+        // Leaving or deleting the group takes its devices away.
+        send(&panel, post_form_with("/groups/leave", "user=ben&group=Lager", &felix)).await;
+        assert!(sees(ben.clone()).await.is_empty());
+        send(&panel, post_form_with("/groups/join", "user=ben&group=Lager", &felix)).await;
+        send(&panel, post_form_with("/groups/delete", "name=Lager", &felix)).await;
+        assert!(sees(ben.clone()).await.is_empty());
+        assert_eq!(db.device_owner("Lager-PC").await.unwrap(), Some((String::new(), String::new())));
     }
 
     #[hbb_common::tokio::test]

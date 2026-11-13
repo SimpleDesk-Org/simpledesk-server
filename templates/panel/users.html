@@ -1,0 +1,101 @@
+{% extends "panel/base.html" %}
+{% block title %}Benutzer{% endblock %}
+{% block nav %}{% include "panel/nav.html" %}{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>Benutzer</h1>
+  <p class="hint">Alle, die sich schon einmal {% if !oidc_name.is_empty() %}über {{ oidc_name }} {% endif %}angemeldet haben. Admins stehen in ADMIN_USERS und dürfen immer alles.
+  <b>Abmelden</b> beendet alle Anmeldungen in Clients und Panel. <b>Sperren</b> meldet ab, und die Person kann sich nicht mehr anmelden.</p>
+  {% if !error.is_empty() %}<p class="error">{{ error }}</p>{% endif %}
+  {% if users.is_empty() %}
+  <p class="empty">Noch hat sich niemand angemeldet.</p>
+  {% else %}
+  <div class="table-wrap">
+  <table>
+    <thead>
+      <tr><th>Name</th><th>Gruppen</th><th>Letzte Anmeldung (UTC)</th><th>Zuletzt aktiv (UTC)</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for person in users %}
+      <tr>
+        <td class="id">{{ person.name }}
+          {% if person.admin %}<span class="badge">Admin</span>{% else %}<span class="badge quiet">Benutzer</span>{% endif %}
+          {% if person.blocked %}<span class="badge danger">gesperrt</span>{% endif %}
+        </td>
+        <td>
+          {% for group in person.groups %}
+          <form class="chip" method="post" action="/groups/leave">
+            <input type="hidden" name="user" value="{{ person.name }}">
+            <input type="hidden" name="group" value="{{ group }}">
+            {{ group }} <button class="link" type="submit" title="Aus der Gruppe nehmen" aria-label="{{ person.name }} aus {{ group }} nehmen">×</button>
+          </form>
+          {% endfor %}
+          {% if !person.other_groups.is_empty() %}
+          <form class="inline" method="post" action="/groups/join">
+            <input type="hidden" name="user" value="{{ person.name }}">
+            <select name="group" aria-label="Gruppe für {{ person.name }}">{% for group in person.other_groups %}<option>{{ group }}</option>{% endfor %}</select>
+            <button class="link" type="submit">Hinzufügen</button>
+          </form>
+          {% endif %}
+        </td>
+        <td>{% if person.last_login.is_empty() %}–{% else %}{{ person.last_login }}{% endif %}</td>
+        <td>{% if person.last_active.is_empty() %}–{% else %}{{ person.last_active }}{% endif %}</td>
+        <td class="actions">
+          <form method="post" action="/users/signout">
+            <input type="hidden" name="name" value="{{ person.name }}">
+            <button class="link" type="submit">Abmelden</button>
+          </form>
+          {% if person.blocked %}
+          <form method="post" action="/users/unblock">
+            <input type="hidden" name="name" value="{{ person.name }}">
+            <button class="link" type="submit">Entsperren</button>
+          </form>
+          {% else if !person.admin && !person.me %}
+          <form method="post" action="/users/block" onsubmit="return confirm('Wirklich sperren? Die Person wird überall abgemeldet und kann sich nicht mehr anmelden.')">
+            <input type="hidden" name="name" value="{{ person.name }}">
+            <button class="link danger" type="submit">Sperren</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+</section>
+
+<section class="card add">
+  <h2>Gruppen</h2>
+  <p class="hint">Mitglieder einer Gruppe dürfen die Geräte der Gruppe sehen und steuern. Welche Geräte zu einer Gruppe gehören, stellst du bei den Geräten ein.</p>
+  {% if groups.is_empty() %}
+  <p class="empty">Noch keine Gruppen.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr><th>Gruppe</th><th>Mitglieder</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for group in groups %}
+      <tr>
+        <td class="id">{{ group.name }}</td>
+        <td>{{ group.members }}</td>
+        <td class="actions">
+          <form method="post" action="/groups/delete" onsubmit="return confirm('Gruppe wirklich löschen? Ihre Geräte gehören dann zu keiner Gruppe mehr.')">
+            <input type="hidden" name="name" value="{{ group.name }}">
+            <button class="link danger" type="submit">Löschen</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+  <form class="inline add" method="post" action="/groups/new">
+    <label>Neue Gruppe
+      <input name="name" placeholder="Bürgerbüro" required maxlength="100">
+    </label>
+    <button type="submit">Gruppe anlegen</button>
+  </form>
+</section>
+{% endblock %}

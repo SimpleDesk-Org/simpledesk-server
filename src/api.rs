@@ -70,7 +70,8 @@ async fn lookup_token(pm: &PeerMap, token: &str) -> ResultType<Option<String>> {
         .await
 }
 
-/// The user an access token belongs to; None for an empty, unknown, expired or failing lookup.
+/// The user an access token belongs to; None for an empty, unknown, expired or failing lookup,
+/// and for a blocked user.
 pub(crate) async fn token_user(pm: &PeerMap, token: &str) -> Option<String> {
     match lookup_token(pm, token).await {
         Ok(user) => user,
@@ -78,6 +79,46 @@ pub(crate) async fn token_user(pm: &PeerMap, token: &str) -> Option<String> {
             log::error!("SimpleDesk API: reading token failed: {}", err);
             None
         }
+    }
+}
+
+/// Whether `user` may see and control device `id`: admins always, everybody else only as its
+/// owner or as a member of its group. A device without owner and group is for admins only.
+pub(crate) async fn may_control(pm: &PeerMap, user: &str, id: &str) -> bool {
+    if pm.accounts.is_admin(user) {
+        return true;
+    }
+    let result: ResultType<bool> = async {
+        let Some((owner, group)) = pm.db.device_owner(id).await? else {
+            return Ok(false);
+        };
+        if !owner.is_empty() && owner == user {
+            return Ok(true);
+        }
+        Ok(!group.is_empty() && pm.db.user_groups(user).await?.contains(&group))
+    }
+    .await;
+    result.unwrap_or_else(|err| {
+        log::error!("SimpleDesk API: reading the owner of {} failed: {}", id, err);
+        false
+    })
+}
+
+/// After a client login, the user becomes the owner of the device the client runs on, if the
+/// device ID and uuid match the registered device. A login of an admin changes nothing, so
+/// helping somebody on their device does not take it from them.
+async fn take_device(panel: &Panel, user: &str, id: &str, uuid: &str) {
+    if id.is_empty() || panel.pm.accounts.is_admin(user) {
+        return;
+    }
+    let Ok(uuid) = base64::decode(uuid.trim()) else {
+        log::warn!("SimpleDesk API: login of {} on {} with an unreadable uuid", user, id);
+        return;
+    };
+    match panel.pm.db.set_owner_from_login(id, &uuid, user).await {
+        Ok(true) => log::info!("SimpleDesk API: device {} now belongs to {}", id, user),
+        Ok(false) => log::warn!("SimpleDesk API: {} signed in on {}, but no device with this ID and uuid is registered", user, id),
+        Err(err) => log::error!("SimpleDesk API: saving the owner of {} failed: {}", id, err),
     }
 }
 
@@ -105,14 +146,14 @@ async fn user_of(panel: &Panel, headers: &HeaderMap) -> Result<String, Response>
     }
 }
 
-fn user_json(name: &str) -> Value {
+fn user_json(panel: &Panel, name: &str) -> Value {
     json!({
         "name": name,
         "display_name": name,
         "email": "",
         "note": "",
         "status": 1,
-        "is_admin": true,
+        "is_admin": panel.pm.accounts.is_admin(name),
         "info": {},
     })
 }
@@ -156,7 +197,7 @@ async fn token_response(panel: &Panel, name: &str, device_id: &str) -> Response 
     Json(json!({
         "type": "access_token",
         "access_token": token,
-        "user": user_json(name),
+        "user": user_json(panel, name),
     }))
     .into_response()
 }
@@ -201,7 +242,10 @@ async fn oidc_auth_query(
         .await
     {
         ClientLoginState::Waiting => Json(json!({ "error": "No authed oidc is found" })).into_response(),
-        ClientLoginState::Done(user) => token_response(&panel, &user, field("id")).await,
+        ClientLoginState::Done(user) => {
+            take_device(&panel, &user, field("id"), field("uuid")).await;
+            token_response(&panel, &user, field("id")).await
+        }
         ClientLoginState::Unknown => {
             api_error(StatusCode::BAD_REQUEST, "Die Anmeldung ist abgelaufen. Bitte noch einmal starten.")
         }
@@ -220,7 +264,7 @@ async fn login(Extension(panel): Extension<Arc<Panel>>) -> Response {
 
 async fn current_user(Extension(panel): Extension<Arc<Panel>>, headers: HeaderMap) -> Response {
     match user_of(&panel, &headers).await {
-        Ok(user) => Json(user_json(&user)).into_response(),
+        Ok(user) => Json(user_json(&panel, &user)).into_response(),
         Err(res) => res,
     }
 }
@@ -661,6 +705,47 @@ mod tests {
         assert_eq!(super::token_user(&panel.pm, &fresh).await.as_deref(), Some("felix"));
         let hash = super::token_hash(&token);
         assert_eq!(panel.pm.db.get_api_token_user(&hash, 100_000).await.unwrap(), None);
+    }
+
+    #[hbb_common::tokio::test]
+    async fn signing_in_on_a_device_makes_it_yours_but_not_for_admins() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = crate::peer::test_peer_map(&dir).await;
+        pm.accounts = Arc::new(crate::accounts::Accounts::with_admins("felix"));
+        let panel = Arc::new(Panel::new(pm, Default::default()).await.unwrap());
+        let db = &panel.pm.db;
+        db.insert_peer("Anna-PC", b"uuid-anna", b"pk", "").await.unwrap();
+        let uuid = base64::encode(b"uuid-anna");
+        let owner = || async { db.device_owner("Anna-PC").await.unwrap().unwrap() };
+        let none = (String::new(), String::new());
+
+        // Only with the uuid the device registered with.
+        super::take_device(&panel, "carl", "Anna-PC", &base64::encode(b"other")).await;
+        super::take_device(&panel, "carl", "Anna-PC", "kein base64").await;
+        assert_eq!(owner().await, none);
+        super::take_device(&panel, "anna", "Anna-PC", &uuid).await;
+        assert_eq!(owner().await, ("anna".to_owned(), String::new()));
+        assert!(super::may_control(&panel.pm, "anna", "Anna-PC").await);
+        assert!(!super::may_control(&panel.pm, "carl", "Anna-PC").await);
+
+        // An admin who signs in to help does not take the device.
+        super::take_device(&panel, "Felix", "Anna-PC", &uuid).await;
+        assert_eq!(owner().await.0, "anna");
+        assert!(super::may_control(&panel.pm, "felix", "Anna-PC").await);
+
+        // The next user who signs in there becomes the owner; the group stays.
+        assert!(db.create_group("Amt").await.unwrap());
+        assert!(db.assign_device("Anna-PC", "anna", "Amt").await.unwrap());
+        super::take_device(&panel, "ben", "Anna-PC", &uuid).await;
+        assert_eq!(owner().await, ("ben".to_owned(), "Amt".to_owned()));
+
+        // The client learns the role.
+        let admin = login(&panel, "felix").await;
+        let user = login(&panel, "anna").await;
+        let res = call(&panel, "POST", "/api/currentUser", Some(&admin), Some(json!({}))).await;
+        assert_eq!(json_of(res).await["is_admin"], true);
+        let res = call(&panel, "POST", "/api/currentUser", Some(&user), Some(json!({}))).await;
+        assert_eq!(json_of(res).await["is_admin"], false);
     }
 
     #[hbb_common::tokio::test]
