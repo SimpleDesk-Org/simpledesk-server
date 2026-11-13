@@ -1,0 +1,44 @@
+{% extends "panel/base.html" %}
+{% block title %}Protokoll{% endblock %}
+{% block nav %}{% include "panel/nav.html" %}{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>Protokoll</h1>
+  <p class="hint">{% if admin %}Hier siehst du, wer sich wann mit welchem Gerät verbunden hat, welche Dateien dabei übertragen wurden, Alarme der Geräte und Änderungen im Panel.{% else %}Hier siehst du, was auf deinen Geräten und den Geräten deiner Gruppen passiert ist, und was du selbst geändert hast.{% endif %}
+  Einträge bleiben {{ days }} Tage. Zeiten in UTC.</p>
+  <form class="inline filter" method="get" action="/log">
+    <label>Gerät<input name="device" value="{{ device }}" placeholder="ID"></label>
+    <label>Benutzer<input name="user" value="{{ user_filter }}" placeholder="Name"></label>
+    <label>Von<input type="date" name="from" value="{{ from }}"></label>
+    <label>Bis<input type="date" name="to" value="{{ to }}"></label>
+    <button type="submit">Filtern</button>
+    {% if filtered %}<a class="reset" href="/log">Filter löschen</a>{% endif %}
+  </form>
+  {% if !error.is_empty() %}<p class="error">{{ error }}</p>{% endif %}
+  {% if entries.is_empty() %}
+  <p class="empty">{% if filtered %}Für diesen Filter gibt es keine Einträge.{% else %}Noch keine Einträge.{% endif %}</p>
+  {% else %}
+  <div class="table-wrap">
+  <table class="log">
+    <thead>
+      <tr><th>Zeit (UTC)</th><th>Art</th><th>Benutzer</th><th>Von</th><th>Gerät</th><th>Dauer</th><th>Was</th></tr>
+    </thead>
+    <tbody>
+      {% for entry in entries %}
+      <tr>
+        <td class="time">{{ entry.time }}</td>
+        <td><span class="kind {{ entry.css }}">{{ entry.kind }}</span></td>
+        <td>{% if entry.user.is_empty() %}–{% else %}{{ entry.user }}{% endif %}</td>
+        <td>{% if entry.from.is_empty() %}–{% else %}{{ entry.from }}{% endif %}{% if !entry.ip.is_empty() %}<span class="pending">{{ entry.ip }}</span>{% endif %}</td>
+        <td class="id">{% if entry.device.is_empty() %}–{% else %}{{ entry.device }}{% endif %}</td>
+        <td>{{ entry.duration }}</td>
+        <td>{{ entry.detail }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% if limited %}<p class="hint add">Hier stehen nur die neuesten {{ limit }} Einträge. Für ältere grenze den Filter ein.</p>{% endif %}
+  {% endif %}
+</section>
+{% endblock %}

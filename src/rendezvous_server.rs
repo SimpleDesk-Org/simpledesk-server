@@ -589,6 +589,12 @@ impl RendezvousServer {
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
+                        // SimpleDesk: the device sends this back in its log records, so the
+                        // log knows who connected. Never what the controlling side sent.
+                        rf.controlled_context = MessageField::some(ControlledContext {
+                            conn_audit_ref: crate::audit::new_conn_ref(&self.pm, &rf.token, addr).await,
+                            ..Default::default()
+                        });
                         msg_out.set_request_relay(rf);
                         let peer_addr = peer.read().await.socket_addr;
                         self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
@@ -1080,6 +1086,11 @@ impl RendezvousServer {
                     }
                 });
             let socket_addr = AddrMangle::encode(addr).into();
+            // SimpleDesk: the device sends this back in its log records (see audit.rs).
+            let controlled_context = MessageField::some(ControlledContext {
+                conn_audit_ref: crate::audit::new_conn_ref(&self.pm, &ph.token, addr).await,
+                ..Default::default()
+            });
             if same_intranet {
                 log::debug!(
                     "Fetch local addr {:?} {:?} request from {:?}",
@@ -1090,6 +1101,7 @@ impl RendezvousServer {
                 msg_out.set_fetch_local_addr(FetchLocalAddr {
                     socket_addr,
                     relay_server,
+                    controlled_context,
                     ..Default::default()
                 });
             } else {
@@ -1103,6 +1115,7 @@ impl RendezvousServer {
                     socket_addr,
                     nat_type: ph.nat_type,
                     relay_server,
+                    controlled_context,
                     ..Default::default()
                 });
             }
@@ -1994,6 +2007,10 @@ mod tests {
             .unwrap();
         assert_eq!(to, Some("198.51.100.1:5000".parse().unwrap()));
         assert!(!msg.has_punch_hole_response());
+        // The device gets a reference for its log records that names who connects.
+        let reference = msg.punch_hole().controlled_context.conn_audit_ref.clone();
+        let who = crate::audit::ref_of(&reference).await;
+        assert_eq!(who, Some(("felix".to_owned(), "203.0.113.9".to_owned())));
 
         // After TOKEN_DAYS the token is refused like an unknown one.
         let hours = rs.pm.accounts.token_days * 24 + 1;

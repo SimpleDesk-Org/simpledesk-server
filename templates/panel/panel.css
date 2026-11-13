@@ -164,3 +164,10 @@ form.inline.add { margin-top: 16px; }
 }
 .tabs a.active { color: var(--text); font-weight: 600; border-color: var(--accent); }
 td.actions form + form { margin-top: 4px; }
+form.filter { margin: 0 0 16px; }
+form.filter input { width: 11em; }
+form.filter a.reset { align-self: center; color: var(--accent); }
+table.log td { vertical-align: top; }
+table.log td.time { white-space: nowrap; }
+.kind { font-size: 13px; color: var(--muted); }
+.kind.alarm { color: var(--error); font-weight: 600; }

@@ -8,7 +8,7 @@
 use crate::common::get_arg;
 use crate::oidc::{Oidc, OidcConfig, Purpose};
 use crate::api::{DeviceState, RULE_FULL, RULE_READ, RULE_WRITE};
-use crate::database::{AbRow, DeviceRow};
+use crate::database::{AbRow, AuditFilter, DeviceRow};
 use crate::peer::PeerMap;
 use crate::rendezvous_server::TcpPeers;
 use askama::Template;
@@ -353,6 +353,55 @@ struct DevicesPage<'a> {
     error: &'a str,
 }
 
+/// The filters of the page "Protokoll", as typed in.
+#[derive(Deserialize)]
+struct LogQuery {
+    #[serde(default)]
+    device: String,
+    #[serde(default)]
+    user: String,
+    /// Days as YYYY-MM-DD (the date field of the browser).
+    #[serde(default)]
+    from: String,
+    #[serde(default)]
+    to: String,
+}
+
+/// A row on the page "Protokoll".
+pub(crate) struct LogEntry {
+    pub(crate) time: String,
+    /// "Verbindung", "Dateien", "Alarm" or "Änderung".
+    pub(crate) kind: &'static str,
+    /// For the style: conn, file, alarm or admin.
+    pub(crate) css: &'static str,
+    pub(crate) user: String,
+    /// The controlling device: its ID and name.
+    pub(crate) from: String,
+    pub(crate) ip: String,
+    pub(crate) device: String,
+    pub(crate) duration: String,
+    pub(crate) detail: String,
+}
+
+#[derive(Template)]
+#[template(path = "panel/log.html")]
+struct LogPage<'a> {
+    user: &'a str,
+    admin: bool,
+    active: &'a str,
+    entries: &'a [LogEntry],
+    device: &'a str,
+    user_filter: &'a str,
+    from: &'a str,
+    to: &'a str,
+    filtered: bool,
+    /// More rows match than the page shows.
+    limited: bool,
+    limit: usize,
+    days: i64,
+    error: &'a str,
+}
+
 #[derive(Deserialize)]
 struct SetIdForm {
     id: String,
@@ -556,6 +605,7 @@ pub(crate) async fn start(
             return;
         }
     };
+    hbb_common::tokio::spawn(crate::audit::clean_up_regularly(panel.pm.clone()));
     let addr = SocketAddr::new(bind_addr.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)), port);
     match axum::Server::try_bind(&addr) {
         Ok(server) => {
@@ -583,6 +633,7 @@ pub(crate) fn router(panel: Arc<Panel>) -> Router {
         .route("/ab/remove", post(ab_remove))
         .route("/devices/assign", post(devices_assign))
         .route("/devices/set-id", post(devices_set_id))
+        .route("/log", get(log_page))
         .route("/users", get(users_page))
         .route("/users/signout", post(users_signout))
         .route("/users/block", post(users_block))
@@ -653,6 +704,8 @@ async fn devices_set_id(
     match result {
         Ok(Ok(())) => {
             log::info!("SimpleDesk web panel: {} gave {} the ID {}", admin, id, form.new_id.trim());
+            let detail = format!("ID vergeben: {} → {}", id, form.new_id.trim());
+            crate::audit::log_change(&panel.pm, &admin, id, detail).await;
             redirect("/", None)
         }
         Ok(Err(error)) => render_devices(&panel, &admin, StatusCode::BAD_REQUEST, error).await,
@@ -661,6 +714,136 @@ async fn devices_set_id(
             render_devices(&panel, &admin, StatusCode::INTERNAL_SERVER_ERROR, "Speichern hat nicht geklappt.").await
         }
     }
+}
+
+/// How many rows the page "Protokoll" shows at most.
+const LOG_LIMIT: usize = 500;
+
+/// A day typed as YYYY-MM-DD: its start in unix seconds (UTC). Ok(None) if empty.
+fn day_start(text: &str) -> Result<Option<u64>, ()> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let day = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").map_err(|_| ())?;
+    let start = day.and_hms_opt(0, 0, 0).ok_or(())?.and_utc().timestamp();
+    Ok(Some(start.max(0) as u64))
+}
+
+/// "13.11.2026 09:41:07" (UTC).
+fn time_text(secs: u64) -> String {
+    chrono::DateTime::from_timestamp(secs as i64, 0)
+        .map(|time| time.format("%d.%m.%Y %H:%M:%S").to_string())
+        .unwrap_or_default()
+}
+
+/// "45 s", "12 min" or "2 h 5 min".
+fn duration_text(secs: u64) -> String {
+    if secs < 60 {
+        format!("{} s", secs)
+    } else if secs < 3600 {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{} h {} min", secs / 3600, secs % 3600 / 60)
+    }
+}
+
+fn log_entry(row: &crate::database::AuditRow) -> LogEntry {
+    let (kind, css) = match row.kind.as_str() {
+        "conn" => ("Verbindung", "conn"),
+        "file" => ("Dateien", "file"),
+        "alarm" => ("Alarm", "alarm"),
+        _ => ("Änderung", "admin"),
+    };
+    let (duration, detail) = if row.kind == "conn" {
+        match (row.authorized, row.ended_at) {
+            (true, Some(ended)) => (duration_text(ended.saturating_sub(row.created_at)), row.detail.clone()),
+            (true, None) => ("läuft".to_owned(), row.detail.clone()),
+            (false, Some(_)) => (
+                "–".to_owned(),
+                "Nicht zustande gekommen (zum Beispiel falsches Passwort oder abgelehnt)".to_owned(),
+            ),
+            (false, None) => ("–".to_owned(), "Verbindung wird aufgebaut".to_owned()),
+        }
+    } else {
+        (String::new(), row.detail.clone())
+    };
+    let from = match (row.peer_id.is_empty(), row.peer_name.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => row.peer_name.clone(),
+        (false, true) => row.peer_id.clone(),
+        (false, false) => format!("{} ({})", row.peer_id, row.peer_name),
+    };
+    LogEntry {
+        time: time_text(row.created_at),
+        kind,
+        css,
+        user: row.user.clone(),
+        from,
+        ip: row.ip.clone(),
+        device: row.device_id.clone(),
+        duration,
+        detail,
+    }
+}
+
+/// "Protokoll": admins see everything, a Benutzer what happened on the own devices and the
+/// group's devices, and what the user did.
+async fn log_page(
+    Extension(panel): Extension<Arc<Panel>>,
+    headers: HeaderMap,
+    Query(query): Query<LogQuery>,
+) -> Response {
+    let Some(user) = panel.user(&headers).await else {
+        return redirect("/login", None);
+    };
+    let admin = panel.pm.accounts.is_admin(&user);
+    let mut error = "";
+    let mut day = |text: &str| {
+        day_start(text).unwrap_or_else(|()| {
+            error = "Bitte das Datum als Tag.Monat.Jahr auswählen.";
+            None
+        })
+    };
+    let from = day(&query.from);
+    let until = day(&query.to).map(|start| start + 24 * 3600);
+    let filter = AuditFilter {
+        visible_to: (!admin).then(|| user.clone()),
+        device: query.device.trim().to_owned(),
+        user: query.user.trim().to_owned(),
+        from,
+        until,
+    };
+    let rows = match panel.pm.db.list_audit(&filter, LOG_LIMIT as i64 + 1).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            log::error!("SimpleDesk web panel: reading the log failed: {}", err);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Das Protokoll konnte nicht gelesen werden.").into_response();
+        }
+    };
+    let entries: Vec<LogEntry> = rows.iter().take(LOG_LIMIT).map(log_entry).collect();
+    let status = if error.is_empty() { StatusCode::OK } else { StatusCode::BAD_REQUEST };
+    html(
+        status,
+        LogPage {
+            user: &user,
+            admin,
+            active: "log",
+            entries: &entries,
+            device: query.device.trim(),
+            user_filter: query.user.trim(),
+            from: query.from.trim(),
+            to: query.to.trim(),
+            filtered: [&query.device, &query.user, &query.from, &query.to]
+                .iter()
+                .any(|text| !text.trim().is_empty()),
+            limited: rows.len() > LOG_LIMIT,
+            limit: LOG_LIMIT,
+            days: panel.pm.accounts.audit_days,
+            error,
+        }
+        .render(),
+    )
 }
 
 /// The signed-in admin; everybody else gets the login or a refusal.
@@ -708,6 +891,9 @@ async fn devices_assign(
             owner,
             group
         );
+        let or = |name: &str, none: &str| if name.is_empty() { none.to_owned() } else { name.to_owned() };
+        let detail = format!("Rechte geändert: Besitzer {}, Gruppe {}", or(owner, "niemand"), or(&group, "keine"));
+        crate::audit::log_change(&panel.pm, &admin, form.id.trim(), detail).await;
         Ok(Ok(()))
     }
     .await;
@@ -811,6 +997,8 @@ async fn users_signout(
     let result: ResultType<Result<(), &str>> = async {
         panel.pm.db.delete_user_logins(&form.name).await?;
         log::info!("SimpleDesk web panel: {} signed out {} everywhere", admin, form.name);
+        let detail = format!("Benutzer {} überall abgemeldet", form.name);
+        crate::audit::log_change(&panel.pm, &admin, "", detail).await;
         Ok(Ok(()))
     }
     .await;
@@ -836,6 +1024,7 @@ async fn users_block(
         db.set_blocked(&form.name, true).await?;
         db.delete_user_logins(&form.name).await?;
         log::info!("SimpleDesk web panel: {} blocked {}", admin, form.name);
+        crate::audit::log_change(&panel.pm, &admin, "", format!("Benutzer {} gesperrt", form.name)).await;
         Ok(Ok(()))
     }
     .await;
@@ -854,6 +1043,7 @@ async fn users_unblock(
     let result: ResultType<Result<(), &str>> = async {
         panel.pm.db.set_blocked(&form.name, false).await?;
         log::info!("SimpleDesk web panel: {} unblocked {}", admin, form.name);
+        crate::audit::log_change(&panel.pm, &admin, "", format!("Benutzer {} entsperrt", form.name)).await;
         Ok(Ok(()))
     }
     .await;
@@ -877,6 +1067,7 @@ async fn groups_new(
         if !panel.pm.db.create_group(name).await? {
             return Ok(Err("Diese Gruppe gibt es schon."));
         }
+        crate::audit::log_change(&panel.pm, &admin, "", format!("Gruppe {} angelegt", name)).await;
         Ok(Ok(()))
     }
     .await;
@@ -895,6 +1086,7 @@ async fn groups_delete(
     let result: ResultType<Result<(), &str>> = async {
         panel.pm.db.delete_group(&form.name).await?;
         log::info!("SimpleDesk web panel: {} deleted the group {}", admin, form.name);
+        crate::audit::log_change(&panel.pm, &admin, "", format!("Gruppe {} gelöscht", form.name)).await;
         Ok(Ok(()))
     }
     .await;
@@ -919,6 +1111,8 @@ async fn groups_join(
             return Ok(Err("Diesen Benutzer gibt es nicht."));
         }
         db.add_group_member(&group, &form.user).await?;
+        let detail = format!("{} zur Gruppe {} hinzugefügt", form.user, group);
+        crate::audit::log_change(&panel.pm, &admin, "", detail).await;
         Ok(Ok(()))
     }
     .await;
@@ -936,6 +1130,8 @@ async fn groups_leave(
     };
     let result: ResultType<Result<(), &str>> = async {
         panel.pm.db.remove_group_member(&form.group, &form.user).await?;
+        let detail = format!("{} aus der Gruppe {} entfernt", form.user, form.group);
+        crate::audit::log_change(&panel.pm, &admin, "", detail).await;
         Ok(Ok(()))
     }
     .await;
@@ -1206,6 +1402,9 @@ async fn ab_share(
             name,
             right_label(form.rule)
         );
+        let who = if kind == "group" { "der Gruppe" } else { "dem Benutzer" };
+        let detail = format!("Adressbuch {} mit {} {} geteilt ({})", book.name, who, name, right_label(form.rule));
+        crate::audit::log_change(&panel.pm, &user, "", detail).await;
         Ok(Ok(()))
     }
     .await;
@@ -1225,6 +1424,11 @@ async fn ab_unshare(
         Err(res) => return res,
     };
     let result = panel.pm.db.delete_ab_rule(&book.guid, &form.kind, &form.name).await;
+    if result.is_ok() {
+        let who = if form.kind == "group" { "der Gruppe" } else { "dem Benutzer" };
+        let detail = format!("Adressbuch {} nicht mehr mit {} {} geteilt", book.name, who, form.name);
+        crate::audit::log_change(&panel.pm, &user, "", detail).await;
+    }
     book_done(&panel, &user, &book, result.map(Ok)).await
 }
 
@@ -1270,6 +1474,7 @@ async fn ab_remove(
     match panel.pm.db.delete_shared_ab(&book.guid).await {
         Ok(()) => {
             log::info!("SimpleDesk web panel: {} deleted the shared address book {}", user, book.name);
+            crate::audit::log_change(&panel.pm, &user, "", format!("Adressbuch {} gelöscht", book.name)).await;
             redirect("/ab", None)
         }
         Err(err) => {
@@ -1856,6 +2061,83 @@ mod tests {
         assert!(row("Aus-PC").contains("<span class=\"dot off\"></span>Offline (seit 3 h)"), "{page}");
         assert!(row("Nie-PC").contains("<span class=\"dot off\"></span>Offline</td>"), "{page}");
         assert!(page.contains("4 Geräte, davon 2 online"), "{page}");
+    }
+
+    #[hbb_common::tokio::test]
+    async fn log_page_shows_what_each_user_may_see() {
+        use crate::database::NewAudit;
+        let dir = tempfile::tempdir().unwrap();
+        let panel = test_panel(&dir).await;
+        let db = &panel.pm.db;
+        for id in ["Anna-PC", "Lager-PC"] {
+            db.insert_peer(id, id.as_bytes(), b"pk", "{}").await.unwrap();
+        }
+        let felix = signed_in(&panel, "felix").await;
+        let anna = signed_in(&panel, "anna").await;
+        signed_in(&panel, "ben").await;
+
+        // Changes by the admin land in the log.
+        send(&panel, post_form_with("/devices/assign", "id=Anna-PC&owner=anna&group=", &felix)).await;
+        send(&panel, post_form_with("/users/block", "name=ben", &felix)).await;
+        // A connection of 12 minutes to each device.
+        let started = crate::api::unix_now() - 3600;
+        for (id, user) in [("Anna-PC", "felix"), ("Lager-PC", "carl")] {
+            let row = NewAudit {
+                created_at: started,
+                kind: "conn",
+                device_guid: db.device_guid(id).await.unwrap(),
+                device_id: id.to_owned(),
+                user: user.to_owned(),
+                peer_id: "Felix-Laptop".to_owned(),
+                peer_name: "FELIX-NB".to_owned(),
+                ip: "203.0.113.9".to_owned(),
+                conn_id: 1,
+                authorized: true,
+                detail: "Fernsteuerung".to_owned(),
+                ..Default::default()
+            };
+            let row = db.insert_audit(&row).await.unwrap();
+            db.end_audit_conn(row, started + 12 * 60).await.unwrap();
+        }
+        let page_of = |cookie: &str, query: &str| {
+            let panel = panel.clone();
+            let req = get(&format!("/log{query}"), Some(cookie));
+            async move { body(send(&panel, req).await).await }
+        };
+        let has_device = |page: &str, id: &str| page.contains(&format!("<td class=\"id\">{id}</td>"));
+
+        // The admin sees everything.
+        let page = page_of(&felix, "").await;
+        assert!(page.contains("Rechte geändert: Besitzer anna, Gruppe keine"), "{page}");
+        assert!(page.contains("Benutzer ben gesperrt"), "{page}");
+        assert!(has_device(&page, "Lager-PC") && page.contains("Felix-Laptop (FELIX-NB)"), "{page}");
+        assert!(page.contains("<td>12 min</td>") && page.contains("Fernsteuerung"), "{page}");
+        assert!(page.contains("href=\"/log\" class=\"active\""), "{page}");
+
+        // anna only sees what happened on her device.
+        let page = page_of(&anna, "").await;
+        assert!(has_device(&page, "Anna-PC") && page.contains("Rechte geändert"), "{page}");
+        assert!(!page.contains("Lager-PC") && !page.contains("gesperrt"), "{page}");
+
+        // Filters: device, user and days.
+        let page = page_of(&felix, "?device=lager").await;
+        assert!(has_device(&page, "Lager-PC") && !has_device(&page, "Anna-PC"), "{page}");
+        let page = page_of(&felix, "?user=CARL").await;
+        assert!(has_device(&page, "Lager-PC") && !page.contains("gesperrt"), "{page}");
+        let page = page_of(&felix, &format!("?from={0}&to={0}", time_day(started))).await;
+        assert!(has_device(&page, "Lager-PC"), "{page}");
+        let page = page_of(&felix, &format!("?from={}", time_day(started + 3 * 24 * 3600))).await;
+        assert!(page.contains("Für diesen Filter gibt es keine Einträge"), "{page}");
+        let res = send(&panel, get("/log?from=gestern", Some(&felix))).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // Without a session it leads to the login.
+        assert_eq!(location(&send(&panel, get("/log", None)).await), "/login");
+    }
+
+    /// The day of `secs` as the date field of the browser sends it.
+    fn time_day(secs: u64) -> String {
+        chrono::DateTime::from_timestamp(secs as i64, 0).unwrap().format("%Y-%m-%d").to_string()
     }
 
     #[hbb_common::tokio::test]

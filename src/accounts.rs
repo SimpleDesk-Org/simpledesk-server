@@ -10,6 +10,7 @@
 //! an admin gave it an ID in the panel, and a device may change its ID only to the one an
 //! admin chose for it.
 //! AFK_MINUTES: after how many minutes without input an online device counts as AFK (default 5).
+//! AUDIT_DAYS: how many days the page "Protokoll" keeps its entries (default 180).
 
 use crate::common::get_arg;
 use hbb_common::log;
@@ -17,6 +18,7 @@ use hbb_common::log;
 pub(crate) const DEFAULT_TOKEN_DAYS: i64 = 14;
 pub(crate) const DEFAULT_SESSION_HOURS: i64 = 8;
 pub(crate) const DEFAULT_AFK_MINUTES: i64 = 5;
+pub(crate) const DEFAULT_AUDIT_DAYS: i64 = 180;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Accounts {
@@ -30,6 +32,8 @@ pub(crate) struct Accounts {
     pub(crate) ids_by_admin: bool,
     /// Minutes without input after which an online device is AFK.
     pub(crate) afk_minutes: i64,
+    /// Days the log keeps its entries.
+    pub(crate) audit_days: i64,
 }
 
 impl Default for Accounts {
@@ -40,6 +44,7 @@ impl Default for Accounts {
             admins: Vec::new(),
             ids_by_admin: false,
             afk_minutes: DEFAULT_AFK_MINUTES,
+            audit_days: DEFAULT_AUDIT_DAYS,
         }
     }
 }
@@ -52,13 +57,15 @@ impl Accounts {
             admins: parse_names(&get_arg("ADMIN_USERS")),
             ids_by_admin: get_arg("IDS_BY_ADMIN").trim().to_uppercase() == "Y",
             afk_minutes: positive("AFK_MINUTES", DEFAULT_AFK_MINUTES),
+            audit_days: positive("AUDIT_DAYS", DEFAULT_AUDIT_DAYS),
         };
         log::info!(
-            "TOKEN_DAYS={}, PANEL_SESSION_HOURS={}, IDS_BY_ADMIN={}, AFK_MINUTES={}",
+            "TOKEN_DAYS={}, PANEL_SESSION_HOURS={}, IDS_BY_ADMIN={}, AFK_MINUTES={}, AUDIT_DAYS={}",
             accounts.token_days,
             accounts.session_hours,
             if accounts.ids_by_admin { "Y" } else { "N" },
-            accounts.afk_minutes
+            accounts.afk_minutes,
+            accounts.audit_days
         );
         if accounts.admins.is_empty() {
             log::warn!("ADMIN_USERS is empty: nobody can manage users, and devices without owner cannot be controlled");

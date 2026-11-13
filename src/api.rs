@@ -42,15 +42,11 @@ pub(crate) fn routes() -> Router {
         .route("/api/device-group/accessible", get(empty_page))
         .route("/api/users", get(empty_page))
         .route("/api/peers", get(empty_page))
-        .route("/api/audit/*rest", any(ok_empty))
+        .route("/api/audit/*rest", any(crate::audit::audit))
 }
 
 fn api_error(status: StatusCode, msg: &str) -> Response {
     (status, Json(json!({ "error": msg }))).into_response()
-}
-
-async fn ok_empty() -> Response {
-    StatusCode::OK.into_response()
 }
 
 async fn empty_page() -> Response {
@@ -351,6 +347,8 @@ async fn change_id(Extension(panel): Extension<Arc<Panel>>, headers: HeaderMap, 
     match assign_id(&panel.pm, req.id.trim(), &uuid, &req.new_id).await {
         Ok(Ok(())) => {
             log::info!("SimpleDesk API: {} changes the ID of {} to {}", user, req.id.trim(), req.new_id.trim());
+            let detail = format!("ID geändert: {} → {}", req.id.trim(), req.new_id.trim());
+            crate::audit::log_change(&panel.pm, &user, req.id.trim(), detail).await;
             Json(json!({})).into_response()
         }
         Ok(Err(msg)) => refuse(msg),
@@ -1387,7 +1385,8 @@ mod tests {
         assert_eq!(sysinfo, json!({"hostname": "BUERO-12", "os": "windows / Windows 11"}));
         let res = call(&panel, "GET", "/api/peers?accessible&status=1", None, None).await;
         assert_eq!(json_of(res).await, json!({"total": 0, "data": []}));
-        let res = call(&panel, "POST", "/api/audit/conn", None, Some(json!({}))).await;
+        // Log records are stored (see audit.rs); other audit calls stay quiet.
+        let res = call(&panel, "GET", "/api/audit/conn/active?id=Felix-Work-PC", None, None).await;
         assert_eq!(res.status(), StatusCode::OK);
     }
 }

@@ -221,6 +221,27 @@ impl Database {
                 guid blob primary key not null,
                 last_seen integer not null
             )",
+            // The page "Protokoll": connections, files, alarms and changes by admins. Times are
+            // unix seconds. kind: conn, file, alarm or admin. user: who connected (signed in
+            // on the controlling device) or who changed something. peer_*: the controlling
+            // device. A connection row gets ended_at when it closes.
+            "create table if not exists audit_log (
+                id integer primary key autoincrement,
+                created_at integer not null,
+                kind varchar(10) not null,
+                device_guid blob,
+                device_id varchar(100) not null default '',
+                user varchar(100) not null default '',
+                peer_id varchar(100) not null default '',
+                peer_name varchar(100) not null default '',
+                ip varchar(64) not null default '',
+                conn_id integer not null default 0,
+                authorized integer not null default 0,
+                ended_at integer,
+                detail text not null default ''
+            )",
+            "create index if not exists index_audit_created on audit_log (created_at)",
+            "create index if not exists index_audit_conn on audit_log (device_guid, conn_id)",
         ] {
             sqlx::query(statement)
                 .execute(self.pool.get().await?.deref_mut())
@@ -869,6 +890,147 @@ impl Database {
             .collect())
     }
 
+    /// The guid of the registered device with this ID.
+    pub async fn device_guid(&self, id: &str) -> ResultType<Option<Vec<u8>>> {
+        Ok(sqlx::query_scalar::<_, Vec<u8>>("select guid from peer where id = ?")
+            .bind(id)
+            .fetch_optional(self.pool.get().await?.deref_mut())
+            .await?)
+    }
+
+    /// Adds a row to the log and returns its id.
+    pub async fn insert_audit(&self, row: &NewAudit) -> ResultType<i64> {
+        let done = sqlx::query(
+            "insert into audit_log(created_at, kind, device_guid, device_id, user, peer_id, peer_name,
+                ip, conn_id, authorized, detail) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(row.created_at as i64)
+        .bind(row.kind)
+        .bind(&row.device_guid)
+        .bind(&row.device_id)
+        .bind(&row.user)
+        .bind(&row.peer_id)
+        .bind(&row.peer_name)
+        .bind(&row.ip)
+        .bind(row.conn_id)
+        .bind(row.authorized as i64)
+        .bind(&row.detail)
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(done.last_insert_rowid())
+    }
+
+    /// The newest connection of this device with this connection number that has not ended
+    /// and began after `since`: its row id and user.
+    pub async fn open_audit_conn(&self, device_guid: &[u8], conn_id: i64, since: u64) -> ResultType<Option<(i64, String)>> {
+        Ok(sqlx::query_as::<_, (i64, String)>(
+            "select id, user from audit_log where kind = 'conn' and device_guid = ? and conn_id = ?
+                and ended_at is null and created_at >= ? order by id desc limit 1",
+        )
+        .bind(device_guid)
+        .bind(conn_id)
+        .bind(since as i64)
+        .fetch_optional(self.pool.get().await?.deref_mut())
+        .await?)
+    }
+
+    /// The controlling device logged in: who it is and what kind of connection.
+    pub async fn authorize_audit_conn(&self, id: i64, peer_id: &str, peer_name: &str, detail: &str) -> ResultType<()> {
+        sqlx::query("update audit_log set authorized = 1, peer_id = ?, peer_name = ?, detail = ? where id = ?")
+            .bind(peer_id)
+            .bind(peer_name)
+            .bind(detail)
+            .bind(id)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn end_audit_conn(&self, id: i64, ended_at: u64) -> ResultType<()> {
+        sqlx::query("update audit_log set ended_at = ? where id = ?")
+            .bind(ended_at as i64)
+            .bind(id)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
+    }
+
+    /// Deletes rows older than `before` (unix seconds); returns how many.
+    pub async fn delete_old_audit(&self, before: u64) -> ResultType<u64> {
+        let done = sqlx::query("delete from audit_log where created_at < ?")
+            .bind(before as i64)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(done.rows_affected())
+    }
+
+    /// The newest rows of the log that match `filter`, at most `limit`.
+    pub async fn list_audit(&self, filter: &AuditFilter, limit: i64) -> ResultType<Vec<AuditRow>> {
+        enum Arg<'a> {
+            Text(&'a str),
+            Int(i64),
+        }
+        let mut sql = String::from(
+            "select a.created_at, a.kind, a.device_id, a.user, a.peer_id, a.peer_name, a.ip,
+                a.authorized, a.ended_at, a.detail from audit_log a where 1 = 1",
+        );
+        let mut args = Vec::new();
+        if let Some(user) = filter.visible_to.as_deref() {
+            // A Benutzer sees the rows of the own devices and of the group's devices, and
+            // what the user did.
+            sql.push_str(
+                " and (a.user = ? or a.device_guid in (select o.guid from device_owner o
+                    where o.owner = ? or (o.grp != '' and o.grp in
+                        (select grp from user_group_member where user = ?))))",
+            );
+            args.extend([Arg::Text(user), Arg::Text(user), Arg::Text(user)]);
+        }
+        if !filter.device.is_empty() {
+            sql.push_str(" and a.device_id like '%' || ? || '%'");
+            args.push(Arg::Text(&filter.device));
+        }
+        if !filter.user.is_empty() {
+            sql.push_str(" and a.user like '%' || ? || '%'");
+            args.push(Arg::Text(&filter.user));
+        }
+        if let Some(from) = filter.from {
+            sql.push_str(" and a.created_at >= ?");
+            args.push(Arg::Int(from as i64));
+        }
+        if let Some(until) = filter.until {
+            sql.push_str(" and a.created_at < ?");
+            args.push(Arg::Int(until as i64));
+        }
+        sql.push_str(" order by a.id desc limit ?");
+        args.push(Arg::Int(limit));
+        type Row = (i64, String, String, String, String, String, String, i64, Option<i64>, String);
+        let mut query = sqlx::query_as::<_, Row>(&sql);
+        for arg in args {
+            query = match arg {
+                Arg::Text(text) => query.bind(text),
+                Arg::Int(number) => query.bind(number),
+            };
+        }
+        let rows = query.fetch_all(self.pool.get().await?.deref_mut()).await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(created_at, kind, device_id, user, peer_id, peer_name, ip, authorized, ended_at, detail)| AuditRow {
+                    created_at: created_at.max(0) as u64,
+                    kind,
+                    device_id,
+                    user,
+                    peer_id,
+                    peer_name,
+                    ip,
+                    authorized: authorized != 0,
+                    ended_at: ended_at.map(|ended| ended.max(0) as u64),
+                    detail,
+                },
+            )
+            .collect())
+    }
+
     /// Notes when the device with this guid was last seen (unix seconds).
     pub async fn save_last_seen(&self, guid: &[u8], last_seen: u64) -> ResultType<()> {
         sqlx::query("insert or replace into device_seen(guid, last_seen) values(?, ?)")
@@ -952,6 +1114,48 @@ pub struct DeviceRow {
     pub sysinfo: String,
     /// When the device was last seen (unix seconds) as the database knows it, 0 if never.
     pub last_seen: u64,
+}
+
+/// A new row of the log (see audit_log).
+#[derive(Default)]
+pub struct NewAudit {
+    pub created_at: u64,
+    pub kind: &'static str,
+    pub device_guid: Option<Vec<u8>>,
+    pub device_id: String,
+    pub user: String,
+    pub peer_id: String,
+    pub peer_name: String,
+    pub ip: String,
+    pub conn_id: i64,
+    pub authorized: bool,
+    pub detail: String,
+}
+
+/// A row of the log as the page "Protokoll" shows it.
+pub struct AuditRow {
+    pub created_at: u64,
+    pub kind: String,
+    pub device_id: String,
+    pub user: String,
+    pub peer_id: String,
+    pub peer_name: String,
+    pub ip: String,
+    pub authorized: bool,
+    pub ended_at: Option<u64>,
+    pub detail: String,
+}
+
+/// Which rows of the log to show. Text filters match a part, in any case.
+#[derive(Default)]
+pub struct AuditFilter {
+    /// Only what this Benutzer may see; None for an admin.
+    pub visible_to: Option<String>,
+    pub device: String,
+    pub user: String,
+    /// From this time on and before `until` (unix seconds).
+    pub from: Option<u64>,
+    pub until: Option<u64>,
 }
 
 #[cfg(test)]
