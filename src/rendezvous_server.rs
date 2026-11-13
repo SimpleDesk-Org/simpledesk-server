@@ -619,7 +619,7 @@ impl RendezvousServer {
                     let mut msg_out = RendezvousMessage::new();
                     if !rr.relay_server.is_empty() {
                         if self.is_lan(addr_b) {
-                            // https://github.com/rustdesk/rustdesk-server/issues/24
+                            // RustDesk server issue #24
                             rr.relay_server = self.inner.local_ip.clone();
                         } else if rr.relay_server == self.inner.local_ip {
                             rr.relay_server = self.get_relay_server(addr.ip(), addr_b.ip());
@@ -1081,7 +1081,7 @@ impl RendezvousServer {
             let mut relay_server = self.get_relay_server(addr.ip(), peer_addr.ip());
             if ALWAYS_USE_RELAY.load(Ordering::SeqCst) || (peer_is_lan ^ is_lan) {
                 if peer_is_lan {
-                    // https://github.com/rustdesk/rustdesk-server/issues/24
+                    // RustDesk server issue #24
                     relay_server = self.inner.local_ip.clone()
                 }
                 ph.nat_type = NatType::SYMMETRIC.into(); // will force relay
@@ -1535,7 +1535,7 @@ impl RendezvousServer {
                 // the WebSocket port directly to untrusted networks; only the
                 // reverse proxy, which overwrites these headers, should be able to
                 // connect to it.
-                // https://github.com/rustdesk/rustdesk-server/issues/634
+                // RustDesk server issue #634
                 let real_ip = headers
                     .get("X-Real-IP")
                     .or_else(|| headers.get("X-Forwarded-For"))

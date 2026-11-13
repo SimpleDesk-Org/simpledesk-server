@@ -1,6 +1,6 @@
 # SimpleDesk Server
 
-SimpleDesk ist ein Fork des kostenlosen RustDesk-Servers ([rustdesk/rustdesk-server](https://github.com/rustdesk/rustdesk-server)) unter derselben Lizenz (AGPL-3.0). Ziel: Alles läuft über Port 443, auch wenn eine Firewall nur Webseiten durchlässt.
+SimpleDesk ist ein Fork des kostenlosen RustDesk-Servers (`rustdesk/rustdesk-server`) unter derselben Lizenz (AGPL-3.0). Ziel: Alles läuft über Port 443, auch wenn eine Firewall nur Webseiten durchlässt.
 
 ## Änderungen gegenüber dem RustDesk-Server
 
@@ -125,24 +125,13 @@ Die Einträge schickt das Gerät, auf das zugegriffen wird. Wer sich verbunden h
 
 # RustDesk Server Program
 
-[![build](https://github.com/rustdesk/rustdesk-server/actions/workflows/build.yaml/badge.svg)](https://github.com/rustdesk/rustdesk-server/actions/workflows/build.yaml)
+[![build](https://github.com/SimpleDesk-Org/simpledesk-server/actions/workflows/simpledesk.yml/badge.svg)](https://github.com/SimpleDesk-Org/simpledesk-server/actions/workflows/simpledesk.yml)
 
-[**Download**](https://github.com/rustdesk/rustdesk-server/releases)
-
-[**Manual**](https://rustdesk.com/docs/en/self-host/)
+[**Docker image**](https://github.com/SimpleDesk-Org/simpledesk-server/pkgs/container/simpledesk-server)
 
 [**Configuration & environment variables**](docs/environment-variables.md)
 
-[**FAQ**](https://github.com/rustdesk/rustdesk/wiki/FAQ)
-
-[**How to migrate OSS to Pro**](https://rustdesk.com/docs/en/self-host/rustdesk-server-pro/installscript/#convert-from-open-source)
-
 Self-host your own RustDesk server, it is free and open source.
-
-> [!IMPORTANT]
-> **Need more features?** [RustDesk Server Pro](https://rustdesk.com/pricing.html) might suit you better.
->
-> **Want to develop your own server?** Start with [rustdesk-server-demo](https://github.com/rustdesk/rustdesk-server-demo), a simpler starting point than this repository.
 
 ## How to build manually
 
@@ -156,7 +145,7 @@ Three executables will be generated in target/release.
 - hbbr - RustDesk relay server
 - rustdesk-utils - RustDesk CLI utilities
 
-You can find updated binaries on the [Releases](https://github.com/rustdesk/rustdesk-server/releases) page.
+The Docker image `ghcr.io/simpledesk-org/simpledesk-server` is built by `.github/workflows/simpledesk.yml`.
 
 ## Configuration
 
@@ -181,4 +170,4 @@ bandwidth tuning, Docker image variables, and examples.
 
 ## Installation
 
-Please follow this [doc](https://rustdesk.com/docs/en/self-host/rustdesk-server-oss/)
+See [docs/environment-variables.md](docs/environment-variables.md).

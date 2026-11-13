@@ -1351,7 +1351,7 @@ mod tests {
     async fn server_info_names_the_key_without_login() {
         let dir = tempfile::tempdir().unwrap();
         let pm = crate::peer::test_peer_map(&dir).await;
-        let key = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=";
+        let key = "oIBV/eAASyIOAgFAnxxUbBo+Xiabq2J99V9XtgEizPU=";
         let panel = Arc::new(
             Panel::new(pm, Default::default())
                 .await
