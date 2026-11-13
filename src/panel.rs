@@ -34,6 +34,11 @@ const MAX_ID_LEN: usize = 100;
 const DEFAULT_TAG_COLOR: i64 = 0xFF1F6FEB;
 
 const PANEL_CSS: &str = include_str!("../templates/panel/panel.css");
+// The SimpleDesk icon, from branding/ in the client repository.
+const ICON_SVG: &str = include_str!("../templates/panel/icons/icon.svg");
+const ICON_32: &[u8] = include_bytes!("../templates/panel/icons/icon-32.png");
+const ICON_180: &[u8] = include_bytes!("../templates/panel/icons/icon-180.png");
+const ICON_512: &[u8] = include_bytes!("../templates/panel/icons/icon-512.png");
 
 pub(crate) struct Panel {
     pub(crate) pm: PeerMap,
@@ -661,6 +666,11 @@ pub(crate) fn router(panel: Arc<Panel>) -> Router {
         .route("/oidc/login", get(oidc_login))
         .route("/oidc/callback", get(oidc_callback))
         .route("/panel.css", get(css))
+        .route("/icon.svg", get(|| async { asset("image/svg+xml", ICON_SVG.as_bytes()) }))
+        .route("/icon-32.png", get(|| async { asset("image/png", ICON_32) }))
+        .route("/favicon.ico", get(|| async { asset("image/png", ICON_32) }))
+        .route("/icon-180.png", get(|| async { asset("image/png", ICON_180) }))
+        .route("/icon-512.png", get(|| async { asset("image/png", ICON_512) }))
         .merge(crate::api::routes())
         .layer(Extension(panel))
 }
@@ -1627,6 +1637,15 @@ async fn css() -> Response {
     res
 }
 
+/// A file of the panel that browsers may keep for a day.
+fn asset(content_type: &'static str, bytes: &'static [u8]) -> Response {
+    let mut res = bytes.into_response();
+    let headers = res.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=86400"));
+    res
+}
+
 fn html(status: StatusCode, page: askama::Result<String>) -> Response {
     match page {
         Ok(page) => (status, Html(page)).into_response(),
@@ -1744,6 +1763,16 @@ mod tests {
         let page = body(send(&panel, get("/login", None)).await).await;
         assert!(!page.contains("<input") && !page.contains("Passwort"), "{page}");
         assert!(page.contains("nicht eingerichtet"), "{page}");
+        // Every page has the SimpleDesk icon, in the tab and in the header.
+        assert!(page.contains("<link rel=\"icon\" href=\"/icon.svg\" type=\"image/svg+xml\">"), "{page}");
+        assert!(page.contains("<img src=\"/icon.svg\""), "{page}");
+        for (path, kind) in [("/icon.svg", "image/svg+xml"), ("/icon-32.png", "image/png"), ("/favicon.ico", "image/png"), ("/icon-180.png", "image/png"), ("/icon-512.png", "image/png")] {
+            let res = send(&panel, get(path, None)).await;
+            assert_eq!(res.status(), StatusCode::OK, "{path}");
+            assert_eq!(res.headers()[header::CONTENT_TYPE], kind, "{path}");
+        }
+        let png = hyper::body::to_bytes(send(&panel, get("/icon-32.png", None)).await.into_body()).await.unwrap();
+        assert_eq!(&png[..], ICON_32);
         // Every page links to its source code (AGPL).
         assert!(page.contains("href=\"https://github.com/SimpleDesk-Org/simpledesk-server\">Quellcode</a>"), "{page}");
         assert!(page.contains("Open Source (AGPL)"), "{page}");

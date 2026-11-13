@@ -39,7 +39,8 @@ body {
   background: var(--card);
   border-bottom: 1px solid var(--line);
 }
-.brand { font-weight: 700; font-size: 17px; }
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 17px; }
+.brand img { display: block; }
 nav { display: flex; align-items: center; gap: 16px; }
 nav form { margin: 0; }
 .user { color: var(--muted); }
