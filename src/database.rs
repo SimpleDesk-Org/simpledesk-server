@@ -181,9 +181,34 @@ impl Database {
                 color integer not null,
                 primary key (ab, name)
             )",
+            // Logins in the web panel, stored only as a hash.
+            "create table if not exists panel_session (
+                token_hash varchar(64) primary key not null,
+                user varchar(100) not null,
+                created_at datetime not null default(current_timestamp),
+                last_used datetime
+            )",
         ] {
             sqlx::query(statement)
                 .execute(self.pool.get().await?.deref_mut())
+                .await?;
+        }
+        self.add_column("api_token", "last_used", "datetime").await?;
+        Ok(())
+    }
+
+    /// Adds a column to a table of an older database. SQLite has no "add column if not exists".
+    async fn add_column(&self, table: &str, column: &str, definition: &str) -> ResultType<()> {
+        let mut conn = self.pool.get().await?;
+        let columns = sqlx::query_scalar::<_, String>(&format!(
+            "select name from pragma_table_info('{}')",
+            table
+        ))
+        .fetch_all(conn.deref_mut())
+        .await?;
+        if !columns.iter().any(|name| name == column) {
+            sqlx::query(&format!("alter table {} add column {} {}", table, column, definition))
+                .execute(conn.deref_mut())
                 .await?;
         }
         Ok(())
@@ -199,14 +224,28 @@ impl Database {
         Ok(())
     }
 
-    /// The user of a token, if the token exists and its user still exists.
-    pub async fn get_api_token_user(&self, token_hash: &str) -> ResultType<Option<String>> {
-        Ok(sqlx::query_scalar::<_, String>(
-            "select t.user from api_token t join panel_user u on u.name = t.user where t.token_hash = ?",
+    /// The user of a token that is younger than `max_age_days`, if its user still exists.
+    /// Notes the use, at most once a minute.
+    pub async fn get_api_token_user(&self, token_hash: &str, max_age_days: i64) -> ResultType<Option<String>> {
+        let mut conn = self.pool.get().await?;
+        let user = sqlx::query_scalar::<_, String>(
+            "select t.user from api_token t join panel_user u on u.name = t.user
+             where t.token_hash = ? and t.created_at > datetime('now', ?)",
         )
         .bind(token_hash)
-        .fetch_optional(self.pool.get().await?.deref_mut())
-        .await?)
+        .bind(format!("-{} days", max_age_days))
+        .fetch_optional(conn.deref_mut())
+        .await?;
+        if user.is_some() {
+            sqlx::query(
+                "update api_token set last_used = current_timestamp
+                 where token_hash = ? and (last_used is null or last_used < datetime('now', '-1 minutes'))",
+            )
+            .bind(token_hash)
+            .execute(conn.deref_mut())
+            .await?;
+        }
+        Ok(user)
     }
 
     pub async fn delete_api_token(&self, token_hash: &str) -> ResultType<()> {
@@ -214,6 +253,78 @@ impl Database {
             .bind(token_hash)
             .execute(self.pool.get().await?.deref_mut())
             .await?;
+        Ok(())
+    }
+
+    pub async fn insert_panel_session(&self, token_hash: &str, user: &str) -> ResultType<()> {
+        sqlx::query("insert into panel_session(token_hash, user) values(?, ?)")
+            .bind(token_hash)
+            .bind(user)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
+    }
+
+    /// The user of a panel session that is younger than `max_age_hours`, if its user still
+    /// exists. Notes the use, at most once a minute.
+    pub async fn get_panel_session_user(&self, token_hash: &str, max_age_hours: i64) -> ResultType<Option<String>> {
+        let mut conn = self.pool.get().await?;
+        let user = sqlx::query_scalar::<_, String>(
+            "select s.user from panel_session s join panel_user u on u.name = s.user
+             where s.token_hash = ? and s.created_at > datetime('now', ?)",
+        )
+        .bind(token_hash)
+        .bind(format!("-{} hours", max_age_hours))
+        .fetch_optional(conn.deref_mut())
+        .await?;
+        if user.is_some() {
+            sqlx::query(
+                "update panel_session set last_used = current_timestamp
+                 where token_hash = ? and (last_used is null or last_used < datetime('now', '-1 minutes'))",
+            )
+            .bind(token_hash)
+            .execute(conn.deref_mut())
+            .await?;
+        }
+        Ok(user)
+    }
+
+    pub async fn delete_panel_session(&self, token_hash: &str) -> ResultType<()> {
+        sqlx::query("delete from panel_session where token_hash = ?")
+            .bind(token_hash)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
+    }
+
+    /// Removes tokens and panel sessions that are too old to be used anyway.
+    pub async fn delete_expired_logins(&self, token_days: i64, session_hours: i64) -> ResultType<()> {
+        let mut conn = self.pool.get().await?;
+        sqlx::query("delete from api_token where created_at <= datetime('now', ?)")
+            .bind(format!("-{} days", token_days))
+            .execute(conn.deref_mut())
+            .await?;
+        sqlx::query("delete from panel_session where created_at <= datetime('now', ?)")
+            .bind(format!("-{} hours", session_hours))
+            .execute(conn.deref_mut())
+            .await?;
+        Ok(())
+    }
+
+    /// Tests: moves the logins of a user `hours` into the past.
+    #[cfg(test)]
+    pub async fn age_logins(&self, user: &str, hours: i64) -> ResultType<()> {
+        let mut conn = self.pool.get().await?;
+        for table in ["api_token", "panel_session"] {
+            sqlx::query(&format!(
+                "update {} set created_at = datetime(created_at, ?) where user = ?",
+                table
+            ))
+            .bind(format!("-{} hours", hours))
+            .bind(user)
+            .execute(conn.deref_mut())
+            .await?;
+        }
         Ok(())
     }
 

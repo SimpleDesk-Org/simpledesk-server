@@ -66,6 +66,8 @@ pub(crate) type LockPeer = Arc<RwLock<Peer>>;
 pub(crate) struct PeerMap {
     map: Arc<RwLock<HashMap<String, LockPeer>>>,
     pub(crate) db: database::Database,
+    // SimpleDesk: settings for signed-in users, shared by hbbs and the web panel.
+    pub(crate) accounts: Arc<crate::accounts::Accounts>,
 }
 
 impl PeerMap {
@@ -88,6 +90,7 @@ impl PeerMap {
         let pm = Self {
             map: Default::default(),
             db: database::Database::new(&db).await?,
+            accounts: Arc::new(crate::accounts::Accounts::from_args()),
         };
         Ok(pm)
     }

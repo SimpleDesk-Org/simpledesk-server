@@ -16,34 +16,25 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use hbb_common::{log, tokio, ResultType};
+use crate::api::token_hash;
+use hbb_common::{log, ResultType};
 use serde_derive::Deserialize;
 use sodiumoxide::randombytes::randombytes;
 use std::{
-    collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
-    time::{Duration, Instant},
 };
-use tokio::sync::Mutex;
 
 const COOKIE_NAME: &str = "simpledesk_session";
-const SESSION_DURATION: Duration = Duration::from_secs(8 * 60 * 60);
 const MAX_ID_LEN: usize = 100;
 // Color of tags created in the panel (ARGB, the panel's blue).
 const DEFAULT_TAG_COLOR: i64 = 0xFF1F6FEB;
 
 const PANEL_CSS: &str = include_str!("../templates/panel/panel.css");
 
-struct Session {
-    user: String,
-    expires: Instant,
-}
-
 pub(crate) struct Panel {
     pub(crate) pm: PeerMap,
     tcp_peers: TcpPeers,
-    sessions: Mutex<HashMap<String, Session>>,
     /// Login through an OIDC provider such as Eider. Without it nobody can sign in.
     pub(crate) oidc: Option<Oidc>,
     /// The key clients need, the same text as id_ed25519.pub.
@@ -69,7 +60,6 @@ impl Panel {
         Ok(Self {
             pm,
             tcp_peers,
-            sessions: Default::default(),
             oidc,
             public_key: String::new(),
         })
@@ -90,23 +80,37 @@ impl Panel {
         self.oidc.as_ref().map(|oidc| oidc.config.name.as_str()).unwrap_or_default()
     }
 
+    /// The user of the session cookie, if the session is younger than PANEL_SESSION_HOURS.
     async fn user(&self, headers: &HeaderMap) -> Option<String> {
         let token = session_token(headers)?;
-        let mut sessions = self.sessions.lock().await;
-        sessions.retain(|_, session| session.expires > Instant::now());
-        sessions.get(&token).map(|session| session.user.clone())
+        match self
+            .pm
+            .db
+            .get_panel_session_user(&token_hash(&token), self.pm.accounts.session_hours)
+            .await
+        {
+            Ok(user) => user,
+            Err(err) => {
+                log::error!("SimpleDesk web panel: reading the session failed: {}", err);
+                None
+            }
+        }
     }
 
-    async fn start_session(&self, user: String) -> String {
+    /// A new session for the user; the database keeps only its hash.
+    async fn start_session(&self, user: &str) -> ResultType<String> {
+        let accounts = &self.pm.accounts;
+        if let Err(err) = self
+            .pm
+            .db
+            .delete_expired_logins(accounts.token_days, accounts.session_hours)
+            .await
+        {
+            log::warn!("SimpleDesk web panel: removing expired logins failed: {}", err);
+        }
         let token = hex(&randombytes(32));
-        self.sessions.lock().await.insert(
-            token.clone(),
-            Session {
-                user,
-                expires: Instant::now() + SESSION_DURATION,
-            },
-        );
-        token
+        self.pm.db.insert_panel_session(&token_hash(&token), user).await?;
+        Ok(token)
     }
 
     async fn ab_entries(&self, user: &str) -> ResultType<Vec<AbEntry>> {
@@ -468,11 +472,17 @@ async fn oidc_callback(
         return oidc_done(false, "Fehler beim Speichern.");
     }
     match purpose {
-        Purpose::Panel => {
-            log::info!("SimpleDesk web panel: {} signed in through {}", user, oidc.config.name);
-            let token = panel.start_session(user).await;
-            redirect("/", Some(session_cookie(&token)))
-        }
+        Purpose::Panel => match panel.start_session(&user).await {
+            Ok(token) => {
+                log::info!("SimpleDesk web panel: {} signed in through {}", user, oidc.config.name);
+                let hours = panel.pm.accounts.session_hours;
+                redirect("/", Some(session_cookie(&token, hours)))
+            }
+            Err(err) => {
+                log::error!("SimpleDesk web panel: saving the session of {} failed: {}", user, err);
+                oidc_done(false, "Fehler beim Speichern.")
+            }
+        },
         Purpose::Client(code) => match oidc.client_login_done(&code, &user).await {
             // Naming the device makes a login for somebody else's device stand out.
             Some(device) => oidc_done(
@@ -494,7 +504,9 @@ fn oidc_done(ok: bool, message: &str) -> Response {
 
 async fn logout(Extension(panel): Extension<Arc<Panel>>, headers: HeaderMap) -> Response {
     if let Some(token) = session_token(&headers) {
-        panel.sessions.lock().await.remove(&token);
+        if let Err(err) = panel.pm.db.delete_panel_session(&token_hash(&token)).await {
+            log::error!("SimpleDesk web panel: deleting the session failed: {}", err);
+        }
     }
     redirect(
         "/login",
@@ -543,12 +555,12 @@ fn redirect_to(to: &str, cookie: Option<String>) -> Response {
 /// Lax, not Strict: after the login at the provider the browser comes back from another site,
 /// and a Strict cookie set on the callback would not go along with the redirect to "/", so the
 /// login would end on the login page again. Lax still keeps the cookie off cross-site POSTs.
-fn session_cookie(token: &str) -> String {
+fn session_cookie(token: &str, hours: i64) -> String {
     format!(
         "{}={}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={}",
         COOKIE_NAME,
         token,
-        SESSION_DURATION.as_secs()
+        hours * 60 * 60
     )
 }
 
@@ -573,6 +585,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use hbb_common::tokio;
     use tower::ServiceExt;
 
     async fn test_panel(dir: &tempfile::TempDir) -> Arc<Panel> {
@@ -610,7 +623,8 @@ mod tests {
 
     /// A session as the provider login leaves it (the login itself is tested in oidc.rs).
     async fn signed_in(panel: &Arc<Panel>, user: &str) -> String {
-        format!("{}={}", COOKIE_NAME, panel.start_session(user.to_owned()).await)
+        panel.pm.db.ensure_external_user(user).await.unwrap();
+        format!("{}={}", COOKIE_NAME, panel.start_session(user).await.unwrap())
     }
 
     #[hbb_common::tokio::test]
@@ -696,10 +710,29 @@ mod tests {
         assert!(panel.pm.db.list_ab_peers(&guid).await.unwrap().is_empty());
     }
 
+    #[hbb_common::tokio::test]
+    async fn panel_session_ends_after_the_configured_hours() {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = test_panel(&dir).await;
+        let cookie = signed_in(&panel, "felix").await;
+        assert_eq!(send(&panel, get("/", Some(&cookie))).await.status(), StatusCode::OK);
+        // The session is in the database, so it survives a restart of hbbs.
+        let restarted = Arc::new(Panel::new(panel.pm.clone(), Default::default()).await.unwrap());
+        assert_eq!(send(&restarted, get("/", Some(&cookie))).await.status(), StatusCode::OK);
+        // One hour before the end it still works, after the end it leads to the login.
+        let hours = panel.pm.accounts.session_hours;
+        panel.pm.db.age_logins("felix", hours - 1).await.unwrap();
+        assert_eq!(send(&panel, get("/", Some(&cookie))).await.status(), StatusCode::OK);
+        panel.pm.db.age_logins("felix", 2).await.unwrap();
+        let res = send(&panel, get("/", Some(&cookie))).await;
+        assert_eq!(location(&res), "/login");
+    }
+
     #[test]
     fn cookie_helpers() {
-        let cookie = session_cookie("abc");
+        let cookie = session_cookie("abc", 8);
         assert!(cookie.contains("HttpOnly") && cookie.contains("Secure") && cookie.contains("SameSite=Lax"));
+        assert!(cookie.contains("Max-Age=28800"), "{cookie}");
         let mut headers = HeaderMap::new();
         headers.insert(
             header::COOKIE,

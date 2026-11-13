@@ -841,7 +841,7 @@ impl RendezvousServer {
     /// SimpleDesk: whether a connection request may go on. Always, unless LOGIN_REQUIRED=Y;
     /// then only with the access token of a signed-in user.
     async fn signed_in(&self, token: &str) -> bool {
-        !self.inner.login_required || crate::api::token_user(&self.pm.db, token).await.is_some()
+        !self.inner.login_required || crate::api::token_user(&self.pm, token).await.is_some()
     }
 
     /// SimpleDesk: the device echoed the heartbeat, so it is still online.
@@ -1922,6 +1922,16 @@ mod tests {
             .unwrap();
         assert_eq!(to, Some("198.51.100.1:5000".parse().unwrap()));
         assert!(!msg.has_punch_hole_response());
+
+        // After TOKEN_DAYS the token is refused like an unknown one.
+        let hours = rs.pm.accounts.token_days * 24 + 1;
+        rs.pm.db.age_logins("felix", hours).await.unwrap();
+        let (msg, to) = rs
+            .handle_punch_hole_request(requester, request(token), "", true)
+            .await
+            .unwrap();
+        assert!(to.is_none());
+        assert_eq!(msg.punch_hole_response().other_failure, LOGIN_REQUIRED_MESSAGE);
     }
 
     async fn serve_one(rs: &RendezvousServer, ws: bool) -> SocketAddr {

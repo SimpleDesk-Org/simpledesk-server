@@ -6,6 +6,7 @@
 
 use crate::oidc::ClientLoginState;
 use crate::panel::{hex, Panel};
+use crate::peer::PeerMap;
 use axum::{
     body::Bytes,
     extract::{Extension, Path, Query},
@@ -14,7 +15,7 @@ use axum::{
     routing::{any, get, post},
     Json, Router,
 };
-use hbb_common::log;
+use hbb_common::{log, ResultType};
 use serde_derive::Deserialize;
 use serde_json::{json, Map, Value};
 use sodiumoxide::{crypto::hash::sha256, randombytes::randombytes};
@@ -57,13 +58,21 @@ pub(crate) fn token_hash(token: &str) -> String {
     hex(&sha256::hash(token.as_bytes()).0)
 }
 
-/// The user an access token belongs to; None for an empty, unknown or failing lookup.
-pub(crate) async fn token_user(db: &crate::database::Database, token: &str) -> Option<String> {
+/// The user of a valid access token: known and younger than TOKEN_DAYS. Ok(None) for an
+/// empty, unknown or expired token.
+async fn lookup_token(pm: &PeerMap, token: &str) -> ResultType<Option<String>> {
     let token = token.trim();
     if token.is_empty() {
-        return None;
+        return Ok(None);
     }
-    match db.get_api_token_user(&token_hash(token)).await {
+    pm.db
+        .get_api_token_user(&token_hash(token), pm.accounts.token_days)
+        .await
+}
+
+/// The user an access token belongs to; None for an empty, unknown, expired or failing lookup.
+pub(crate) async fn token_user(pm: &PeerMap, token: &str) -> Option<String> {
+    match lookup_token(pm, token).await {
         Ok(user) => user,
         Err(err) => {
             log::error!("SimpleDesk API: reading token failed: {}", err);
@@ -86,7 +95,7 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 async fn user_of(panel: &Panel, headers: &HeaderMap) -> Result<String, Response> {
     let unauthorized = || api_error(StatusCode::UNAUTHORIZED, "Bitte neu anmelden.");
     let token = bearer(headers).ok_or_else(unauthorized)?;
-    match panel.pm.db.get_api_token_user(&token_hash(token)).await {
+    match lookup_token(&panel.pm, token).await {
         Ok(Some(user)) => Ok(user),
         Ok(None) => Err(unauthorized()),
         Err(err) => {
@@ -131,12 +140,15 @@ async fn login_options(Extension(panel): Extension<Arc<Panel>>) -> Response {
 /// A new token for a signed-in user, as the answer the client expects after a login.
 async fn token_response(panel: &Panel, name: &str, device_id: &str) -> Response {
     let token = hex(&randombytes(32));
-    if let Err(err) = panel
-        .pm
-        .db
-        .insert_api_token(&token_hash(&token), name, device_id)
+    let db = &panel.pm.db;
+    let accounts = &panel.pm.accounts;
+    if let Err(err) = db
+        .delete_expired_logins(accounts.token_days, accounts.session_hours)
         .await
     {
+        log::warn!("SimpleDesk API: removing expired logins failed: {}", err);
+    }
+    if let Err(err) = db.insert_api_token(&token_hash(&token), name, device_id).await {
         log::error!("SimpleDesk API: saving token failed: {}", err);
         return api_error(StatusCode::BAD_REQUEST, "Serverfehler.");
     }
@@ -623,6 +635,32 @@ mod tests {
 
     async fn json_of_any(res: Response) -> Value {
         serde_json::from_str(&text(res).await).unwrap()
+    }
+
+    #[hbb_common::tokio::test]
+    async fn token_ends_after_the_configured_days() {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = test_panel(&dir).await;
+        let token = login(&panel, "felix").await;
+        let current_user = || call(&panel, "POST", "/api/currentUser", Some(&token), Some(json!({})));
+        assert_eq!(current_user().await.status(), StatusCode::OK);
+
+        // A day before the end it still works, then the client gets the 401 that logs it out.
+        let days = panel.pm.accounts.token_days;
+        panel.pm.db.age_logins("felix", (days - 1) * 24).await.unwrap();
+        assert_eq!(current_user().await.status(), StatusCode::OK);
+        assert_eq!(super::token_user(&panel.pm, &token).await.as_deref(), Some("felix"));
+        panel.pm.db.age_logins("felix", 25).await.unwrap();
+        assert_eq!(current_user().await.status(), StatusCode::UNAUTHORIZED);
+        let res = call(&panel, "POST", "/api/ab/personal", Some(&token), None).await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(super::token_user(&panel.pm, &token).await, None);
+
+        // The next login removes the old token from the database.
+        let fresh = login(&panel, "felix").await;
+        assert_eq!(super::token_user(&panel.pm, &fresh).await.as_deref(), Some("felix"));
+        let hash = super::token_hash(&token);
+        assert_eq!(panel.pm.db.get_api_token_user(&hash, 100_000).await.unwrap(), None);
     }
 
     #[hbb_common::tokio::test]

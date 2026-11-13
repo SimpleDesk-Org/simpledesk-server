@@ -3,6 +3,7 @@ pub use rendezvous_server::*;
 pub mod common;
 mod database;
 mod oidc;
+mod accounts;
 mod api;
 mod panel;
 mod peer;
