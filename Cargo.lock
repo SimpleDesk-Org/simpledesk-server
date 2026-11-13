@@ -745,7 +745,7 @@ dependencies = [
 [[package]]
 name = "confy"
 version = "0.4.0-2"
-source = "git+https://github.com/rustdesk-org/confy#83db9ec19a2f97e9718aef69e4fc5611bb382479"
+source = "git+https://github.com/SimpleDesk-Org/confy?rev=83db9ec19a2f97e9718aef69e4fc5611bb382479#83db9ec19a2f97e9718aef69e4fc5611bb382479"
 dependencies = [
  "directories-next",
  "serde",
@@ -969,7 +969,7 @@ dependencies = [
 [[package]]
 name = "default_net"
 version = "0.1.0"
-source = "git+https://github.com/rustdesk-org/default_net#78f8f70cd85151a3a2c4a3230d80d5272703c02e"
+source = "git+https://github.com/SimpleDesk-Org/default_net?rev=78f8f70cd85151a3a2c4a3230d80d5272703c02e#78f8f70cd85151a3a2c4a3230d80d5272703c02e"
 dependencies = [
  "anyhow",
  "regex",
@@ -2478,7 +2478,7 @@ dependencies = [
 [[package]]
 name = "machine-uid"
 version = "0.3.0"
-source = "git+https://github.com/rustdesk-org/machine-uid#381ff579c1dc3a6c54db9dfec47c44bcb0246542"
+source = "git+https://github.com/SimpleDesk-Org/machine-uid?rev=381ff579c1dc3a6c54db9dfec47c44bcb0246542#381ff579c1dc3a6c54db9dfec47c44bcb0246542"
 dependencies = [
  "bindgen",
  "cc",
@@ -3420,7 +3420,7 @@ dependencies = [
 [[package]]
 name = "reqwest"
 version = "0.11.23"
-source = "git+https://github.com/rustdesk-org/reqwest#9cb758c9fb2f4edc62eb790acfd45a6a3da21ed3"
+source = "git+https://github.com/SimpleDesk-Org/reqwest?rev=9cb758c9fb2f4edc62eb790acfd45a6a3da21ed3#9cb758c9fb2f4edc62eb790acfd45a6a3da21ed3"
 dependencies = [
  "async-compression",
  "base64 0.21.7",
@@ -4327,7 +4327,7 @@ dependencies = [
 [[package]]
 name = "sysinfo"
 version = "0.29.10"
-source = "git+https://github.com/rustdesk-org/sysinfo?branch=rlim_max#90b1705d909a4902dbbbdea37ee64db17841077d"
+source = "git+https://github.com/SimpleDesk-Org/sysinfo?rev=90b1705d909a4902dbbbdea37ee64db17841077d#90b1705d909a4902dbbbdea37ee64db17841077d"
 dependencies = [
  "cfg-if",
  "core-foundation-sys",
@@ -4561,7 +4561,7 @@ dependencies = [
 [[package]]
 name = "tokio-socks"
 version = "0.5.2-1"
-source = "git+https://github.com/rustdesk-org/tokio-socks#94e97c6d7c93b0bcbfa54f2dc397c1da0a6e43d3"
+source = "git+https://github.com/SimpleDesk-Org/tokio-socks?rev=94e97c6d7c93b0bcbfa54f2dc397c1da0a6e43d3#94e97c6d7c93b0bcbfa54f2dc397c1da0a6e43d3"
 dependencies = [
  "bytes",
  "either",
@@ -4619,7 +4619,7 @@ dependencies = [
 [[package]]
 name = "tokio-tungstenite"
 version = "0.29.0"
-source = "git+https://github.com/rustdesk-org/tokio-tungstenite?rev=c241b11b03de4881faf1ecd2fe6e867c92f3013b#c241b11b03de4881faf1ecd2fe6e867c92f3013b"
+source = "git+https://github.com/SimpleDesk-Org/tokio-tungstenite?rev=c241b11b03de4881faf1ecd2fe6e867c92f3013b#c241b11b03de4881faf1ecd2fe6e867c92f3013b"
 dependencies = [
  "futures-util",
  "log",
@@ -4805,7 +4805,7 @@ dependencies = [
 [[package]]
 name = "tungstenite"
 version = "0.29.0"
-source = "git+https://github.com/rustdesk-org/tungstenite-rs?rev=efce47e5364f00a63302cf07ab1fb13ded478914#efce47e5364f00a63302cf07ab1fb13ded478914"
+source = "git+https://github.com/SimpleDesk-Org/tungstenite-rs?rev=efce47e5364f00a63302cf07ab1fb13ded478914#efce47e5364f00a63302cf07ab1fb13ded478914"
 dependencies = [
  "bytes",
  "data-encoding",

@@ -41,7 +41,7 @@ headers = "0.3"
 once_cell = "1.8"
 sodiumoxide = "0.2"
 tempfile = "3"
-tokio-tungstenite = { git = "https://github.com/rustdesk-org/tokio-tungstenite", rev = "c241b11b03de4881faf1ecd2fe6e867c92f3013b", version = "0.29" }
+tokio-tungstenite = { git = "https://github.com/SimpleDesk-Org/tokio-tungstenite", rev = "c241b11b03de4881faf1ecd2fe6e867c92f3013b", version = "0.29" }
 tungstenite = "0.29"
 regex = "1.4"
 tower-http = { version = "0.3", features = ["fs", "trace", "cors"] }
@@ -63,11 +63,11 @@ tower = { version = "0.4", features = ["util"] }
 hyper = "0.14"
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
-# https://github.com/rustdesk/rustdesk-server-pro/issues/189, using native-tls for better tls support
-reqwest = { git = "https://github.com/rustdesk-org/reqwest", features = ["blocking", "socks", "json", "native-tls", "gzip"], default-features=false }
+# RustDesk Server Pro issue #189, using native-tls for better tls support
+reqwest = { git = "https://github.com/SimpleDesk-Org/reqwest", rev = "9cb758c9fb2f4edc62eb790acfd45a6a3da21ed3", features = ["blocking", "socks", "json", "native-tls", "gzip"], default-features=false }
 
 [target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
-reqwest = { git = "https://github.com/rustdesk-org/reqwest", features = ["blocking", "socks", "json", "rustls-tls", "rustls-tls-native-roots", "gzip"], default-features=false }
+reqwest = { git = "https://github.com/SimpleDesk-Org/reqwest", rev = "9cb758c9fb2f4edc62eb790acfd45a6a3da21ed3", features = ["blocking", "socks", "json", "rustls-tls", "rustls-tls-native-roots", "gzip"], default-features=false }
 
 [build-dependencies]
 hbb_common = { path = "libs/hbb_common" }
@@ -87,4 +87,20 @@ strip = true
 #rpath = true # Not needed
 
 [patch.crates-io]
-tungstenite = { git = "https://github.com/rustdesk-org/tungstenite-rs", rev = "efce47e5364f00a63302cf07ab1fb13ded478914" }
+tungstenite = { git = "https://github.com/SimpleDesk-Org/tungstenite-rs", rev = "efce47e5364f00a63302cf07ab1fb13ded478914" }
+
+# SimpleDesk: libs/hbb_common still takes these from RustDesk's forks; use ours at the same commits.
+[patch."https://github.com/rustdesk-org/confy"]
+confy = { git = "https://github.com/SimpleDesk-Org/confy", rev = "83db9ec19a2f97e9718aef69e4fc5611bb382479" }
+
+[patch."https://github.com/rustdesk-org/tokio-socks"]
+tokio-socks = { git = "https://github.com/SimpleDesk-Org/tokio-socks", rev = "94e97c6d7c93b0bcbfa54f2dc397c1da0a6e43d3" }
+
+[patch."https://github.com/rustdesk-org/sysinfo"]
+sysinfo = { git = "https://github.com/SimpleDesk-Org/sysinfo", rev = "90b1705d909a4902dbbbdea37ee64db17841077d" }
+
+[patch."https://github.com/rustdesk-org/default_net"]
+default_net = { git = "https://github.com/SimpleDesk-Org/default_net", rev = "78f8f70cd85151a3a2c4a3230d80d5272703c02e" }
+
+[patch."https://github.com/rustdesk-org/machine-uid"]
+machine-uid = { git = "https://github.com/SimpleDesk-Org/machine-uid", rev = "381ff579c1dc3a6c54db9dfec47c44bcb0246542" }
