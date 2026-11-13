@@ -39,8 +39,8 @@ jobs:
           file: simpledesk/Dockerfile
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/simpledesk-server:latest
-            ghcr.io/${{ github.repository_owner }}/simpledesk-server:${{ github.sha }}
+            ghcr.io/simpledesk-org/simpledesk-server:latest
+            ghcr.io/simpledesk-org/simpledesk-server:${{ github.sha }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.licenses=AGPL-3.0
